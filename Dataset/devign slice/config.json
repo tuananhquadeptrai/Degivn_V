@@ -1,0 +1,7 @@
+{
+  "vocab_size": 1312,
+  "max_len": 512,
+  "train_samples": 21854,
+  "val_samples": 2732,
+  "test_samples": 2732
+}
