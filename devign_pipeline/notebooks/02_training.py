@@ -37,6 +37,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import autocast, GradScaler
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, 
     f1_score, roc_auc_score, confusion_matrix, classification_report
@@ -234,7 +235,80 @@ class RegularizedConfig(LargeTrainConfig):
         return {k: v for k, v in self.__class__.__dict__.items() 
                 if not k.startswith('_') and not callable(v)}
 
-config = RegularizedConfig()
+
+class ImprovedConfig(TrainConfig):
+    """
+    Improved config based on Oracle analysis of training results.
+    
+    Key changes:
+    - Reduced hidden_dim (192 → 128) - less overfitting with smaller capacity
+    - Reduced vuln_feature_hidden_dim (96 → 48) - simpler MLP for 26 features
+    - Added LayerNorm before classifier (enabled via use_layer_norm flag)
+    - Token augmentation (dropout + masking) for robustness
+    - SWA (Stochastic Weight Averaging) for better generalization
+    - Tighter early stopping (patience=3, min_delta=5e-4)
+    """
+    # Model capacity (REDUCED for better generalization)
+    embed_dim: int = 64
+    hidden_dim: int = 128             # DOWN from 192 - BiGRU output = 256
+    num_layers: int = 2               # Keep 2 layers for expressiveness
+    
+    # Regularization
+    rnn_dropout: float = 0.35         # Slightly reduced for smaller model
+    embedding_dropout: float = 0.2
+    classifier_dropout: float = 0.5
+    weight_decay: float = 1e-4
+    label_smoothing: float = 0.05
+    
+    # Vuln features MLP (REDUCED)
+    vuln_feature_hidden_dim: int = 48  # DOWN from 96
+    vuln_feature_dropout: float = 0.25
+    
+    # NEW: LayerNorm before classifier
+    use_layer_norm: bool = True
+    
+    # NEW: Token augmentation (only during training)
+    use_token_augmentation: bool = True
+    token_dropout_prob: float = 0.1    # Randomly drop 10% of tokens
+    token_mask_prob: float = 0.05      # Randomly mask 5% of tokens
+    mask_token_id: int = 1             # UNK token as mask
+    
+    # NEW: SWA (Stochastic Weight Averaging)
+    use_swa: bool = True
+    swa_start_epoch: int = 10          # Start SWA after epoch 10
+    swa_lr: float = 1e-4               # Lower LR for SWA phase
+    
+    # Training
+    batch_size: int = 96
+    learning_rate: float = 3e-4
+    max_lr: float = 1.0e-3
+    max_epochs: int = 25
+    
+    # Early stopping (TIGHTER)
+    patience: int = 3                  # DOWN from 4
+    min_delta: float = 5e-4            # UP from 1e-4
+    
+    # Scheduler
+    scheduler_type: str = 'plateau'
+    scheduler_patience: int = 2
+    scheduler_factor: float = 0.5
+    scheduler_min_lr: float = 1e-6
+    
+    # Data
+    max_seq_length: int = 512
+    accumulation_steps: int = 1
+    num_workers: int = 2
+    
+    # Packed sequences
+    use_packed_sequences: bool = True
+
+    def to_dict(self) -> Dict:
+        return {k: v for k, v in self.__class__.__dict__.items() 
+                if not k.startswith('_') and not callable(v)}
+
+
+# Use ImprovedConfig for this training run
+config = ImprovedConfig()
 
 # %% [markdown]
 # ## 3. Dataset & DataLoader
@@ -386,12 +460,20 @@ class ImprovedHybridBiGRUVulnDetector(nn.Module):
     Improved Hybrid BiGRU with:
     1. Packed sequences support (30-40% speedup)
     2. Dropout on attention context
-    3. Larger capacity (hidden_dim=192, num_layers=2)
+    3. Token augmentation (dropout + masking) during training
+    4. LayerNorm before classifier for better generalization
+    5. Reduced capacity (hidden_dim=128) to combat overfitting
     """
     
     def __init__(self, config: TrainConfig):
         super().__init__()
         self.config = config
+        
+        # Token augmentation params
+        self.use_token_augmentation = getattr(config, 'use_token_augmentation', False)
+        self.token_dropout_prob = getattr(config, 'token_dropout_prob', 0.1)
+        self.token_mask_prob = getattr(config, 'token_mask_prob', 0.05)
+        self.mask_token_id = getattr(config, 'mask_token_id', 1)  # UNK token
         
         # Embedding
         self.embedding = nn.Embedding(
@@ -420,7 +502,7 @@ class ImprovedHybridBiGRUVulnDetector(nn.Module):
             nn.Tanh(),
             nn.Linear(self.rnn_out_dim // 2, 1, bias=False)
         )
-        # NEW: Dropout on attention context (regularization)
+        # Dropout on attention context (regularization)
         self.context_dropout = nn.Dropout(0.2)
         
         # Vuln features branch
@@ -436,6 +518,11 @@ class ImprovedHybridBiGRUVulnDetector(nn.Module):
             self.combined_dim = self.rnn_out_dim + vuln_hidden
         else:
             self.combined_dim = self.rnn_out_dim
+        
+        # LayerNorm before classifier (for better generalization)
+        self.use_layer_norm = getattr(config, 'use_layer_norm', False)
+        if self.use_layer_norm:
+            self.pre_classifier_ln = nn.LayerNorm(self.combined_dim)
             
         # Classifier
         self.classifier = nn.Sequential(
@@ -445,6 +532,37 @@ class ImprovedHybridBiGRUVulnDetector(nn.Module):
             nn.Dropout(config.classifier_dropout),
             nn.Linear(self.combined_dim // 2, 2)
         )
+    
+    def apply_token_augmentation(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Apply token-level augmentation during training:
+        1. Token dropout: randomly replace tokens with PAD (0)
+        2. Token masking: randomly replace tokens with MASK/UNK token
+        
+        Only applied to non-special tokens (skip PAD, BOS, EOS).
+        """
+        if not self.training or not self.use_token_augmentation:
+            return input_ids
+        
+        augmented = input_ids.clone()
+        B, L = input_ids.shape
+        
+        # Create mask for valid tokens (not padding, not special tokens 0,2,3)
+        valid_mask = (input_ids > 3) & (attention_mask > 0)
+        
+        # Token dropout: replace with PAD (0)
+        if self.token_dropout_prob > 0:
+            dropout_mask = torch.rand(B, L, device=input_ids.device) < self.token_dropout_prob
+            dropout_mask = dropout_mask & valid_mask
+            augmented = augmented.masked_fill(dropout_mask, 0)
+        
+        # Token masking: replace with MASK token (UNK=1)
+        if self.token_mask_prob > 0:
+            mask_mask = torch.rand(B, L, device=input_ids.device) < self.token_mask_prob
+            mask_mask = mask_mask & valid_mask & (augmented > 0)  # Don't mask already dropped tokens
+            augmented = augmented.masked_fill(mask_mask, self.mask_token_id)
+        
+        return augmented
         
     def forward(self, input_ids, attention_mask, vuln_features=None, lengths=None):
         """
@@ -456,8 +574,11 @@ class ImprovedHybridBiGRUVulnDetector(nn.Module):
         """
         B, L = input_ids.shape
         
+        # Apply token augmentation during training
+        augmented_ids = self.apply_token_augmentation(input_ids, attention_mask)
+        
         # Embedding
-        embedded = self.embedding(input_ids)  # [B, L, E]
+        embedded = self.embedding(augmented_ids)  # [B, L, E]
         embedded = self.embed_dropout(embedded)
         
         # GRU with optional packing
@@ -500,6 +621,10 @@ class ImprovedHybridBiGRUVulnDetector(nn.Module):
             combined = torch.cat([context_vector, feat_out], dim=1)
         else:
             combined = context_vector
+        
+        # LayerNorm before classifier (if enabled)
+        if self.use_layer_norm:
+            combined = self.pre_classifier_ln(combined)
             
         # Classification
         logits = self.classifier(combined)
@@ -756,6 +881,20 @@ def train(model, train_loader, val_loader, config):
     scaler = GradScaler(enabled=config.use_amp)
     early_stopping = EarlyStopping(config.patience, config.min_delta)
     
+    # SWA setup (Stochastic Weight Averaging)
+    use_swa = getattr(config, 'use_swa', False)
+    swa_model = None
+    swa_scheduler = None
+    swa_start_epoch = getattr(config, 'swa_start_epoch', 10)
+    
+    if use_swa:
+        # Create SWA model wrapper
+        base_model = model.module if isinstance(model, nn.DataParallel) else model
+        swa_model = AveragedModel(base_model)
+        swa_lr = getattr(config, 'swa_lr', 1e-4)
+        swa_scheduler = SWALR(optimizer, swa_lr=swa_lr, anneal_epochs=2)
+        print(f"SWA enabled: starts at epoch {swa_start_epoch}, lr={swa_lr}")
+    
     history = {'train': [], 'val': []}
     best_f1 = 0.0
     best_epoch = 0
@@ -791,8 +930,14 @@ def train(model, train_loader, val_loader, config):
         
         print(f"Ep {epoch:2d}/{config.max_epochs} ({epoch_time:.0f}s) | Train: L={train_metrics['loss']:.3f} F1={train_metrics['f1']:.3f} | Val: L={val_metrics['loss']:.3f} F1={val_metrics['f1']:.3f} AUC={val_metrics['auc_roc']:.3f} T={val_t:.2f}")
         
-        # Scheduler step - use AUC-ROC for more stable monitoring
-        if config.scheduler_type == 'plateau':
+        # SWA update (after swa_start_epoch)
+        if use_swa and epoch >= swa_start_epoch:
+            base_model = model.module if isinstance(model, nn.DataParallel) else model
+            swa_model.update_parameters(base_model)
+            swa_scheduler.step()
+            print(f"  [SWA] Updated averaged model (epoch {epoch})")
+        elif config.scheduler_type == 'plateau':
+            # Only use regular scheduler before SWA kicks in
             scheduler.step(val_metrics['auc_roc'])
         
         # Save best model (based on F1)
@@ -825,6 +970,42 @@ def train(model, train_loader, val_loader, config):
             print(f"Early stopping at epoch {epoch}")
             break
     
+    # SWA: Update BatchNorm statistics and save SWA model
+    swa_threshold = best_threshold_overall
+    if use_swa and swa_model is not None and epoch >= swa_start_epoch:
+        print("\n[SWA] Updating BatchNorm statistics...")
+        # Update BN stats with training data
+        swa_model.to(DEVICE)
+        update_bn(train_loader, swa_model, device=DEVICE)
+        
+        # Evaluate SWA model
+        print("[SWA] Evaluating SWA model...")
+        swa_metrics = evaluate(
+            swa_model, val_loader, criterion, config.use_amp,
+            find_threshold=config.use_optimal_threshold
+        )
+        swa_threshold = swa_metrics['best_threshold']
+        print(f"[SWA] Val: F1={swa_metrics['f1']:.4f} AUC={swa_metrics['auc_roc']:.4f} T={swa_threshold:.2f}")
+        
+        # Save SWA model
+        swa_save_dict = {
+            'epoch': epoch,
+            'model_state_dict': swa_model.module.state_dict(),
+            'val_metrics': swa_metrics,
+            'config': config.to_dict(),
+            'best_threshold': swa_threshold
+        }
+        torch.save(swa_save_dict, os.path.join(MODEL_DIR, 'swa_model.pt'))
+        print(f"[SWA] Saved SWA model to {MODEL_DIR}/swa_model.pt")
+        
+        # Compare SWA vs best model
+        if swa_metrics['f1'] > best_f1:
+            print(f"[SWA] SWA model is BETTER: F1={swa_metrics['f1']:.4f} > {best_f1:.4f}")
+            best_f1 = swa_metrics['f1']
+            best_threshold_overall = swa_threshold
+        else:
+            print(f"[SWA] Best model still better: F1={best_f1:.4f} > {swa_metrics['f1']:.4f}")
+    
     print(f"\n{'='*50}")
     print(f"Done! Best F1={best_f1:.4f} at epoch {best_epoch} (T={best_threshold_overall:.2f})")
     print("="*50)
@@ -833,13 +1014,18 @@ def train(model, train_loader, val_loader, config):
     with open(os.path.join(LOG_DIR, 'training_history.json'), 'w') as f:
         json.dump(history, f, indent=2)
     
-    return history, best_threshold_overall
+    return history, best_threshold_overall, swa_model if use_swa else None
 
 # %% [markdown]
 # ## 7. Run Training
 
 # %%
-history, best_threshold = train(model, train_loader, val_loader, config)
+result = train(model, train_loader, val_loader, config)
+if len(result) == 3:
+    history, best_threshold, swa_model = result
+else:
+    history, best_threshold = result
+    swa_model = None
 
 # %% [markdown]
 # ## 8. Final Evaluation on Test Set
