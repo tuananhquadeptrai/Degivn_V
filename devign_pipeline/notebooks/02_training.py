@@ -341,8 +341,56 @@ class EnhancedConfig(ImprovedConfig):
                 if not k.startswith('_') and not callable(v)}
 
 
-# Use EnhancedConfig for this training run
-config = EnhancedConfig()
+class OptimizedConfig(EnhancedConfig):
+    """
+    Optimized configuration targeting stable F1 > 0.72.
+
+    Key changes vs EnhancedConfig:
+    - Threshold search widened to [0.1, 0.9] with finer step 0.005 (for ensemble).
+    - SWA start epoch moved closer to observed best (17–18) → 14.
+    - Classifier dropout reduced to 0.4 (model not overfitting).
+    - Dynamic label smoothing: 0.05 until epoch 15, then 0.0.
+    - 5-seed ensemble + 1 SWA model (6-model ensemble at eval).
+    - Optional fine-tuning tail at low LR (1e-5) after plateau.
+    """
+
+    # Threshold optimization for ensemble / validation (WIDENED)
+    threshold_min: float = 0.1
+    threshold_max: float = 0.9
+    threshold_step: float = 0.005
+
+    # Classifier dropout (down from 0.5 - model not overfitting)
+    classifier_dropout: float = 0.4
+
+    # SWA timing (moved closer to best epoch 17-18)
+    swa_start_epoch: int = 14
+
+    # Dynamic label smoothing schedule
+    label_smoothing: float = 0.05
+    label_smoothing_warmup_epochs: int = 15  # use smoothing through epoch 15, then 0.0
+
+    # Ensemble: keep 5 base seeds; SWA becomes 6th model at eval
+    ensemble_size: int = 5
+
+    # Fine-tuning tail after plateau
+    use_finetune_tail: bool = True
+    finetune_epochs: int = 3          # number of low-LR epochs
+    finetune_lr: float = 1e-5         # low LR for tail
+
+    def to_dict(self) -> Dict:
+        """Export a full config dict including inherited attributes."""
+        cfg: Dict[str, Any] = {}
+        for cls in reversed(self.__class__.mro()):
+            if cls is object:
+                continue
+            for k, v in cls.__dict__.items():
+                if not k.startswith('_') and not callable(v):
+                    cfg[k] = v
+        return cfg
+
+
+# Use OptimizedConfig for this training run
+config = OptimizedConfig()
 
 # %% [markdown]
 # ## 3. Dataset & DataLoader
@@ -779,13 +827,20 @@ class LabelSmoothingCrossEntropy(nn.Module):
             
         return F.cross_entropy(preds, target, weight=weight, label_smoothing=self.smoothing)
 
-def find_optimal_threshold(y_true, y_probs, min_t=0.1, max_t=0.9, step=0.01):
-    """Find probability threshold that maximizes F1 score"""
+def find_optimal_threshold(y_true, y_probs, min_t=0.1, max_t=0.9, step=0.005):
+    """Find probability threshold that maximizes F1 score.
+    
+    Args:
+        y_true: Ground truth labels
+        y_probs: Predicted probabilities
+        min_t: Minimum threshold to search (default: 0.1)
+        max_t: Maximum threshold to search (default: 0.9)
+        step: Step size for threshold search (default: 0.005 for finer search)
+    """
     thresholds = np.arange(min_t, max_t + step, step)
     best_t = 0.5
     best_f1 = 0.0
     
-    # Vectorized calculation could be faster but loop is clear
     for t in thresholds:
         y_pred = (y_probs >= t).astype(int)
         f1 = f1_score(y_true, y_pred, zero_division=0)
@@ -1041,6 +1096,14 @@ def predict_ensemble(models, loader, threshold, use_amp: bool):
 
 # %%
 def train(model, train_loader, val_loader, config):
+    """
+    Main training loop with dynamic label smoothing, fine-tuning tail, and SWA.
+    
+    Improvements in OptimizedConfig:
+    - Dynamic label smoothing: 0.05 until epoch 15, then 0.0 for sharper boundaries
+    - Fine-tuning tail: low-LR (1e-5) epochs after plateau for fine-grained optimization
+    - SWA starts at epoch 14 (closer to best epoch 17-18)
+    """
     # Calculate class weights
     all_labels = []
     for batch in train_loader:
@@ -1053,14 +1116,9 @@ def train(model, train_loader, val_loader, config):
     ratio = float(neg_count) / float(pos_count)
     weight = torch.tensor([1.0, ratio], dtype=torch.float32, device=DEVICE)
     
-    # Loss function
-    if config.label_smoothing > 0:
-        criterion = LabelSmoothingCrossEntropy(
-            smoothing=config.label_smoothing, 
-            weight=weight
-        )
-    else:
-        criterion = nn.CrossEntropyLoss(weight=weight)
+    # Dynamic label smoothing schedule
+    base_smoothing = float(getattr(config, 'label_smoothing', 0.0))
+    smoothing_warmup_epochs = int(getattr(config, 'label_smoothing_warmup_epochs', 0))
     
     # Optimizer
     optimizer = optim.AdamW(
@@ -1100,15 +1158,22 @@ def train(model, train_loader, val_loader, config):
     use_swa = getattr(config, 'use_swa', False)
     swa_model = None
     swa_scheduler = None
-    swa_start_epoch = getattr(config, 'swa_start_epoch', 10)
+    swa_start_epoch = int(getattr(config, 'swa_start_epoch', 10))
     
     if use_swa:
         # Create SWA model wrapper
         base_model = model.module if isinstance(model, nn.DataParallel) else model
         swa_model = AveragedModel(base_model)
-        swa_lr = getattr(config, 'swa_lr', 1e-4)
+        swa_lr = float(getattr(config, 'swa_lr', 1e-4))
         swa_scheduler = SWALR(optimizer, swa_lr=swa_lr, anneal_epochs=2)
         print(f"SWA enabled: starts at epoch {swa_start_epoch}, lr={swa_lr}")
+    
+    # Fine-tuning tail config
+    use_finetune_tail = bool(getattr(config, 'use_finetune_tail', False))
+    finetune_lr = float(getattr(config, 'finetune_lr', 1e-5))
+    finetune_epochs = int(getattr(config, 'finetune_epochs', 3))
+    in_finetune = False
+    finetune_epochs_done = 0
     
     history = {'train': [], 'val': []}
     best_f1 = 0.0
@@ -1117,10 +1182,29 @@ def train(model, train_loader, val_loader, config):
     
     print("\n" + "="*50)
     print(f"Training: batch={config.batch_size}, epochs={config.max_epochs}, AMP={config.use_amp}")
+    if smoothing_warmup_epochs > 0:
+        print(f"Dynamic label smoothing: {base_smoothing} until epoch {smoothing_warmup_epochs}, then 0.0")
+    if use_finetune_tail:
+        print(f"Fine-tuning tail: {finetune_epochs} epochs at LR={finetune_lr}")
     print("="*50)
     
     for epoch in range(1, config.max_epochs + 1):
         epoch_start = time.time()
+        
+        # Dynamic label smoothing: base_smoothing until warmup_epochs, then 0.0
+        if base_smoothing > 0 and (smoothing_warmup_epochs == 0 or epoch <= smoothing_warmup_epochs):
+            current_smoothing = base_smoothing
+        else:
+            current_smoothing = 0.0
+        
+        # Create criterion with current smoothing
+        if current_smoothing > 0:
+            criterion = LabelSmoothingCrossEntropy(
+                smoothing=current_smoothing, 
+                weight=weight
+            )
+        else:
+            criterion = nn.CrossEntropyLoss(weight=weight)
         
         # Train
         train_metrics = train_epoch(
@@ -1143,7 +1227,13 @@ def train(model, train_loader, val_loader, config):
         current_lr = optimizer.param_groups[0]['lr']
         val_t = val_metrics['best_threshold']
         
-        print(f"Ep {epoch:2d}/{config.max_epochs} ({epoch_time:.0f}s) | Train: L={train_metrics['loss']:.3f} F1={train_metrics['f1']:.3f} | Val: L={val_metrics['loss']:.3f} F1={val_metrics['f1']:.3f} AUC={val_metrics['auc_roc']:.3f} T={val_t:.2f}")
+        print(
+            f"Ep {epoch:2d}/{config.max_epochs} ({epoch_time:.0f}s) | "
+            f"Train: L={train_metrics['loss']:.3f} F1={train_metrics['f1']:.3f} | "
+            f"Val: L={val_metrics['loss']:.3f} F1={val_metrics['f1']:.3f} "
+            f"AUC={val_metrics['auc_roc']:.3f} T={val_t:.2f} | "
+            f"LR={current_lr:.2e} | smooth={current_smoothing:.3f}"
+        )
         
         # SWA update (after swa_start_epoch)
         if use_swa and epoch >= swa_start_epoch:
@@ -1151,8 +1241,8 @@ def train(model, train_loader, val_loader, config):
             swa_model.update_parameters(base_model)
             swa_scheduler.step()
             print(f"  [SWA] Updated averaged model (epoch {epoch})")
-        elif config.scheduler_type == 'plateau':
-            # Only use regular scheduler before SWA kicks in
+        elif config.scheduler_type == 'plateau' and not in_finetune:
+            # Only use regular scheduler before SWA kicks in and not in finetune
             scheduler.step(val_metrics['auc_roc'])
         
         # Save best model (based on F1)
@@ -1180,10 +1270,26 @@ def train(model, train_loader, val_loader, config):
                 'best_threshold': val_t
             }, os.path.join(MODEL_DIR, f'checkpoint_epoch_{epoch}.pt'))
         
-        # Early stopping
+        # Early stopping + optional fine-tuning tail
         if early_stopping(val_metrics['f1']):
-            print(f"Early stopping at epoch {epoch}")
-            break
+            if use_finetune_tail and not in_finetune:
+                # Enter fine-tuning tail at low LR instead of stopping immediately
+                in_finetune = True
+                finetune_epochs_done = 0
+                early_stopping.counter = 0
+                early_stopping.early_stop = False
+                for pg in optimizer.param_groups:
+                    pg['lr'] = finetune_lr
+                print(f"  → Entering fine-tuning tail: LR={finetune_lr:.2e} for up to {finetune_epochs} epochs")
+            else:
+                print(f"Early stopping at epoch {epoch}")
+                break
+        
+        if in_finetune:
+            finetune_epochs_done += 1
+            if finetune_epochs_done >= finetune_epochs:
+                print(f"Completed fine-tuning tail for {finetune_epochs} epochs. Stopping training.")
+                break
     
     # SWA: Update BatchNorm statistics and save SWA model
     swa_threshold = best_threshold_overall
@@ -1205,7 +1311,7 @@ def train(model, train_loader, val_loader, config):
         # Save SWA model
         swa_save_dict = {
             'epoch': epoch,
-            'model_state_dict': swa_model.module.state_dict(),
+            'model_state_dict': swa_model.state_dict(),
             'val_metrics': swa_metrics,
             'config': config.to_dict(),
             'best_threshold': swa_threshold
@@ -1254,12 +1360,11 @@ USE_ENSEMBLE = getattr(config, 'ensemble_size', 1) > 1
 if USE_ENSEMBLE:
     # ============ ENSEMBLE TRAINING ============
     print(f"\n{'='*50}")
-    print(f"ENSEMBLE TRAINING: {config.ensemble_size} models")
+    print(f"ENSEMBLE TRAINING: {config.ensemble_size} models (plus SWA)")
     print(f"{'='*50}\n")
     
     ensemble_models = []
-    all_val_probs = []
-    all_val_labels = None
+    last_swa_model = None
     
     for i in range(config.ensemble_size):
         seed = config.ensemble_base_seed + i
@@ -1281,21 +1386,29 @@ if USE_ENSEMBLE:
         
         ensemble_models.append(model)
         
-        # Collect val probs for ensemble threshold
-        criterion = nn.CrossEntropyLoss()
-        val_metrics = evaluate(model, val_loader, criterion, config.use_amp, find_threshold=False)
-        all_val_probs.append(val_metrics['probs'])
-        if all_val_labels is None:
-            all_val_labels = val_metrics['labels']
+        # Keep track of the last SWA model for 6-model ensemble
+        if swa_model is not None:
+            last_swa_model = swa_model
         
-        # Save this model
+        # Save this base model
         torch.save({
             'model_state_dict': model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
             'seed': seed,
         }, os.path.join(MODEL_DIR, f'ensemble_model_{i}.pt'))
     
-    # Ensemble threshold optimization
-    all_val_probs = np.stack(all_val_probs, axis=0).mean(axis=0)
+    # Add SWA model as the 6th ensemble member (if available)
+    if last_swa_model is not None:
+        last_swa_model.to(DEVICE)
+        ensemble_models.append(last_swa_model)
+        print(f"\n[ENSEMBLE] Added SWA model to ensemble → total {len(ensemble_models)} models")
+    
+    # Ensemble threshold optimization on validation set using all ensemble members
+    val_ens_metrics = predict_ensemble(
+        ensemble_models, val_loader, threshold=0.5, use_amp=config.use_amp
+    )
+    all_val_labels = val_ens_metrics['labels']
+    all_val_probs = val_ens_metrics['probs']
+    
     best_threshold, best_f1 = find_optimal_threshold(
         all_val_labels, all_val_probs,
         min_t=config.threshold_min,
@@ -1303,10 +1416,11 @@ if USE_ENSEMBLE:
         step=config.threshold_step,
     )
     print(f"\n[ENSEMBLE] Optimal threshold: {best_threshold:.3f} (Val F1={best_f1:.4f})")
+    print(f"[ENSEMBLE] Threshold search range: [{config.threshold_min}, {config.threshold_max}], step={config.threshold_step}")
     
     # Final ensemble model reference for evaluation
     model = ensemble_models[0]  # Keep first for single-model eval comparison
-    swa_model = None
+    swa_model = last_swa_model
     
 else:
     # ============ SINGLE MODEL TRAINING ============
