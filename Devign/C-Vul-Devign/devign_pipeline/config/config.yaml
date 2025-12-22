@@ -1,0 +1,20 @@
+# Devign Pipeline Configuration
+
+paths:
+  kaggle_input: /kaggle/input/devign
+  kaggle_working: /kaggle/working
+  checkpoints: checkpoints
+  cache: .cache
+
+processing:
+  max_seq_len: 512
+  min_freq: 2
+  chunk_size: 2000
+
+training:
+  batch_size: 64
+  num_workers: 4
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

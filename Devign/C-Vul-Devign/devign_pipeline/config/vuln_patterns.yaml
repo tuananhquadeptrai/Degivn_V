@@ -1,0 +1,80 @@
+# Vulnerability Patterns for C Code Analysis
+
+buffer_overflow:
+  description: "Buffer overflow vulnerabilities"
+  dangerous_functions:
+    - strcpy
+    - strcat
+    - gets
+    - sprintf
+    - memcpy
+    - memmove
+  patterns:
+    - "strcpy\\s*\\([^,]+,[^)]+\\)"
+    - "strcat\\s*\\([^,]+,[^)]+\\)"
+    - "gets\\s*\\([^)]+\\)"
+    - "sprintf\\s*\\([^,]+,[^)]+\\)"
+    - "memcpy\\s*\\([^,]+,[^,]+,[^)]+\\)"
+    - "memmove\\s*\\([^,]+,[^,]+,[^)]+\\)"
+
+format_string:
+  description: "Format string vulnerabilities"
+  dangerous_functions:
+    - printf
+    - fprintf
+    - sprintf
+    - snprintf
+  patterns:
+    - "printf\\s*\\([^\"]+\\)"
+    - "fprintf\\s*\\([^,]+,[^\"]+\\)"
+    - "sprintf\\s*\\([^,]+,[^\"]+\\)"
+    - "snprintf\\s*\\([^,]+,[^,]+,[^\"]+\\)"
+  user_input_indicators:
+    - argv
+    - gets
+    - fgets
+    - scanf
+    - read
+
+null_pointer:
+  description: "Null pointer dereference vulnerabilities"
+  patterns:
+    - "\\*\\s*\\w+\\s*(?:=|==)\\s*NULL"
+    - "if\\s*\\([^)]*==\\s*NULL[^)]*\\)"
+    - "\\w+\\s*->\\s*\\w+.*(?:malloc|calloc|realloc)"
+  indicators:
+    - missing_null_check_after_malloc
+    - dereference_before_null_check
+    - null_check_bypass
+
+use_after_free:
+  description: "Use after free vulnerabilities"
+  patterns:
+    - "free\\s*\\([^)]+\\)"
+    - "\\*\\s*\\w+.*free"
+  indicators:
+    - pointer_access_after_free
+    - double_free
+    - missing_null_after_free
+  dangerous_sequence:
+    - free
+    - pointer_dereference
+    - pointer_assignment
+
+integer_overflow:
+  description: "Integer overflow vulnerabilities"
+  dangerous_functions:
+    - atoi
+    - atol
+    - strtol
+    - strtoul
+    - strtoll
+  patterns:
+    - "atoi\\s*\\([^)]+\\)"
+    - "atol\\s*\\([^)]+\\)"
+    - "strtol\\s*\\([^)]+\\)"
+    - "strtoul\\s*\\([^)]+\\)"
+  indicators:
+    - unchecked_arithmetic
+    - size_calculation
+    - array_index_calculation
