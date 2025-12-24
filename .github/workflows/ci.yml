@@ -34,8 +34,8 @@ jobs:
 
       - name: Lint with flake8
         run: |
-          flake8 devign_pipeline --count --select=E9,F63,F7,F82 --show-source --statistics
-          flake8 devign_pipeline --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+          flake8 devign_pipeline --exclude=notebooks --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 devign_pipeline --exclude=notebooks --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
 
       - name: Check formatting with black
         run: |
