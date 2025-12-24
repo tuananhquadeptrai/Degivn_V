@@ -54,6 +54,195 @@ class StepStatus(Enum):
     SKIPPED = 'skipped'
 
 
+@dataclass
+class SliceStatistics:
+    """Track and aggregate slicing statistics to monitor fallback rates.
+    
+    This helps identify issues with AST parsing or graph building:
+    - High WINDOW rate (>30%) indicates parser problems
+    - High truncation rate indicates slice_max_len may be too small
+    - High 1-slice rate indicates forward slicing issues
+    """
+    
+    # Slice type counts
+    backward_count: int = 0
+    forward_count: int = 0
+    both_count: int = 0
+    window_count: int = 0  # FALLBACK - indicates parse/graph failure
+    
+    # Additional metrics
+    total_samples: int = 0
+    total_slices: int = 0
+    samples_with_1_slice: int = 0
+    truncated_slices: int = 0
+    empty_slices: int = 0
+    dropped_slices_due_to_max: int = 0
+    
+    # Parse/graph failure tracking
+    parse_failures: int = 0
+    cfg_failures: int = 0
+    dfg_failures: int = 0
+    
+    def add_slice(self, slice_type: str, num_lines: int, max_lines: int = 256,
+                  is_empty: bool = False) -> None:
+        """Record a single slice."""
+        self.total_slices += 1
+        
+        if slice_type == 'backward':
+            self.backward_count += 1
+        elif slice_type == 'forward':
+            self.forward_count += 1
+        elif slice_type == 'both':
+            self.both_count += 1
+        elif slice_type == 'window':
+            self.window_count += 1
+        
+        if is_empty or num_lines == 0:
+            self.empty_slices += 1
+        
+        # Check truncation (approximate: if slice has max lines)
+        if num_lines >= max_lines * 0.95:  # 95% of max = likely truncated
+            self.truncated_slices += 1
+    
+    def add_sample(self, num_slices: int, num_kept: Optional[int] = None) -> None:
+        """Record a sample's slice count."""
+        self.total_samples += 1
+        if num_slices <= 1:
+            self.samples_with_1_slice += 1
+        if num_kept is not None and num_slices > num_kept:
+            self.dropped_slices_due_to_max += (num_slices - num_kept)
+    
+    def record_failure(self, failure_type: str) -> None:
+        """Record a parse/graph building failure."""
+        if failure_type == 'parse':
+            self.parse_failures += 1
+        elif failure_type == 'cfg':
+            self.cfg_failures += 1
+        elif failure_type == 'dfg':
+            self.dfg_failures += 1
+    
+    def get_summary(self) -> Dict[str, Any]:
+        """Get summary statistics with percentages."""
+        total_typed = self.backward_count + self.forward_count + self.both_count + self.window_count
+        
+        def pct(val: int, total: int) -> float:
+            return round(val / max(1, total) * 100, 2)
+        
+        return {
+            'total_samples': self.total_samples,
+            'total_slices': self.total_slices,
+            
+            # Slice type distribution
+            'slice_types': {
+                'backward': self.backward_count,
+                'forward': self.forward_count,
+                'both': self.both_count,
+                'window_fallback': self.window_count,
+            },
+            'slice_type_percentages': {
+                'backward': pct(self.backward_count, total_typed),
+                'forward': pct(self.forward_count, total_typed),
+                'both': pct(self.both_count, total_typed),
+                'window_fallback': pct(self.window_count, total_typed),
+            },
+            
+            # Quality metrics
+            'quality_metrics': {
+                'window_fallback_rate': pct(self.window_count, total_typed),
+                'samples_with_1_slice': self.samples_with_1_slice,
+                'samples_with_1_slice_rate': pct(self.samples_with_1_slice, self.total_samples),
+                'truncated_slices': self.truncated_slices,
+                'truncated_rate': pct(self.truncated_slices, self.total_slices),
+                'empty_slices': self.empty_slices,
+                'empty_rate': pct(self.empty_slices, self.total_slices),
+            },
+            
+            # Failure tracking
+            'failures': {
+                'parse_failures': self.parse_failures,
+                'cfg_failures': self.cfg_failures,
+                'dfg_failures': self.dfg_failures,
+                'total_failures': self.parse_failures + self.cfg_failures + self.dfg_failures,
+            },
+            
+            # Health assessment
+            'health': self._assess_health(),
+        }
+    
+    def _assess_health(self) -> Dict[str, Any]:
+        """Assess overall slicing health."""
+        total_typed = self.backward_count + self.forward_count + self.both_count + self.window_count
+        window_rate = self.window_count / max(1, total_typed) * 100
+        one_slice_rate = self.samples_with_1_slice / max(1, self.total_samples) * 100
+        truncate_rate = self.truncated_slices / max(1, self.total_slices) * 100
+        
+        issues = []
+        if window_rate > 30:
+            issues.append(f"HIGH window fallback rate ({window_rate:.1f}%) - check AST parser")
+        elif window_rate > 10:
+            issues.append(f"Moderate window fallback rate ({window_rate:.1f}%)")
+        
+        if one_slice_rate > 30:
+            issues.append(f"HIGH 1-slice rate ({one_slice_rate:.1f}%) - check forward slicing")
+        elif one_slice_rate > 15:
+            issues.append(f"Moderate 1-slice rate ({one_slice_rate:.1f}%)")
+        
+        if truncate_rate > 10:
+            issues.append(f"HIGH truncation rate ({truncate_rate:.1f}%) - consider increasing slice_max_len")
+        
+        status = 'GOOD' if not issues else ('WARNING' if len(issues) <= 1 else 'NEEDS_ATTENTION')
+        
+        return {
+            'status': status,
+            'issues': issues,
+            'recommendations': self._get_recommendations(window_rate, one_slice_rate, truncate_rate),
+        }
+    
+    def _get_recommendations(self, window_rate: float, one_slice_rate: float, 
+                             truncate_rate: float) -> List[str]:
+        """Get actionable recommendations."""
+        recs = []
+        
+        if window_rate > 10:
+            recs.append("Consider improving AST parser fallback handling")
+            recs.append("Check if code samples have unusual syntax")
+        
+        if one_slice_rate > 15:
+            recs.append("Implement window-based forward slice when forward slice is empty")
+            recs.append("Review forward slicing algorithm for edge cases")
+        
+        if truncate_rate > 5:
+            recs.append("Consider increasing slice_max_len from 256 to 384 or 512")
+        
+        if not recs:
+            recs.append("Slicing quality looks good - no immediate action needed")
+        
+        return recs
+    
+    def to_dict(self) -> Dict[str, int]:
+        """Convert to simple dict for serialization."""
+        return {
+            'backward_count': self.backward_count,
+            'forward_count': self.forward_count,
+            'both_count': self.both_count,
+            'window_count': self.window_count,
+            'total_samples': self.total_samples,
+            'total_slices': self.total_slices,
+            'samples_with_1_slice': self.samples_with_1_slice,
+            'truncated_slices': self.truncated_slices,
+            'empty_slices': self.empty_slices,
+            'dropped_slices_due_to_max': self.dropped_slices_due_to_max,
+            'parse_failures': self.parse_failures,
+            'cfg_failures': self.cfg_failures,
+            'dfg_failures': self.dfg_failures,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, int]) -> 'SliceStatistics':
+        """Create from dict."""
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
 @dataclass 
 class PipelineConfig:
     # Paths
@@ -72,6 +261,8 @@ class PipelineConfig:
     include_control_deps: bool = True
     include_data_deps: bool = True
     max_slice_depth: int = 5
+    max_slices: int = 4
+    slice_max_len: int = 256
     
     # Tokenization
     include_comments: bool = False
@@ -92,6 +283,10 @@ class PipelineConfig:
     
     # Memory management
     gc_after_chunk: bool = True
+    
+    # JSONL export for demo/debugging
+    export_jsonl: bool = False
+    jsonl_subdir: str = 'jsonl'
     
     @classmethod
     def from_yaml(cls, path: str) -> 'PipelineConfig':
@@ -177,6 +372,171 @@ class PipelineState:
         return state
 
 
+class JsonlExporter:
+    """Export pipeline data to JSONL format for demo/debugging purposes.
+    
+    Creates human-readable JSONL files showing:
+    - Original vs sliced code
+    - Tokenization and normalization
+    - Token IDs from vocabulary
+    - Vulnerability features
+    """
+    
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.stats = {
+            'splits': {},
+            'tokens': {},
+            'tokens_with_ids': {},
+        }
+    
+    def _append_line(self, path: Path, obj: dict) -> None:
+        """Append a single JSON line to file"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + '\n')
+    
+    def append_metadata_chunk(self, split: str, df: 'pd.DataFrame') -> None:
+        """Export sample metadata to train/val/test.jsonl
+        
+        Shows: original code, sliced code, labels, vulnerability features
+        """
+        out_path = self.base_dir / f'{split}.jsonl'
+        s_stats = self.stats['splits'].setdefault(split, {
+            'num_samples': 0, 
+            'num_vulnerable': 0,
+            'num_with_vuln_issues': 0
+        })
+        
+        for idx, row in df.iterrows():
+            vuln_features = {}
+            for k in df.columns:
+                if k.startswith('vf_'):
+                    val = row[k]
+                    if pd.notna(val):
+                        vuln_features[k[3:]] = float(val) if isinstance(val, (int, float)) else val
+            
+            original_code = row.get('func', '') or row.get('func_clean', '')
+            sliced_code = row.get('sliced_code', '')
+            target = bool(row.get('target', False))
+            has_vuln_issues = bool(row.get('vuln_has_issues', False))
+            
+            obj = {
+                'id': int(row.get('id', idx)) if pd.notna(row.get('id')) else int(idx),
+                'split': split,
+                'project': str(row.get('project', '')) if pd.notna(row.get('project')) else '',
+                'commit_id': str(row.get('commit_id', '')) if pd.notna(row.get('commit_id')) else '',
+                'target': target,
+                'vuln_risk_score': float(row.get('vuln_risk_score', 0.0)) if pd.notna(row.get('vuln_risk_score')) else 0.0,
+                'vuln_risk_level': str(row.get('vuln_risk_level', 'none')) if pd.notna(row.get('vuln_risk_level')) else 'none',
+                'vuln_has_issues': has_vuln_issues,
+                'vuln_features': vuln_features,
+                'original_code': original_code,
+                'sliced_code': sliced_code,
+                'slice_stats': {
+                    'original_lines': int(row.get('slice_original_lines', 0)) if pd.notna(row.get('slice_original_lines')) else len(original_code.split('\n')),
+                    'slice_lines': int(row.get('slice_slice_lines', 0)) if pd.notna(row.get('slice_slice_lines')) else 0,
+                    'slice_ratio': float(row.get('slice_slice_ratio', 0.0)) if pd.notna(row.get('slice_slice_ratio')) else 0.0,
+                    'slice_type': str(row.get('slice_slice_type', 'backward')) if pd.notna(row.get('slice_slice_type')) else 'backward',
+                },
+            }
+            
+            self._append_line(out_path, obj)
+            s_stats['num_samples'] += 1
+            if target:
+                s_stats['num_vulnerable'] += 1
+            if has_vuln_issues:
+                s_stats['num_with_vuln_issues'] += 1
+    
+    def append_tokens_chunk(
+        self,
+        split: str,
+        df: 'pd.DataFrame',
+        tokens_list: list,
+        normalized_list: list,
+    ) -> None:
+        """Export tokens to tokens.jsonl
+        
+        Shows: raw tokens, normalized tokens for each sample
+        """
+        out_path = self.base_dir / 'tokens.jsonl'
+        t_stats = self.stats['tokens'].setdefault(split, {
+            'num_samples': 0,
+            'total_tokens': 0,
+            'total_normalized_tokens': 0,
+        })
+        
+        for (idx, row), toks, norm in zip(df.iterrows(), tokens_list, normalized_list):
+            obj = {
+                'id': int(row.get('id', idx)) if pd.notna(row.get('id')) else int(idx),
+                'split': split,
+                'sliced_code': row.get('sliced_code', '') or row.get('func', ''),
+                'tokens': toks,
+                'normalized_tokens': norm,
+                'token_count': len(toks),
+                'normalized_token_count': len(norm),
+            }
+            
+            self._append_line(out_path, obj)
+            t_stats['num_samples'] += 1
+            t_stats['total_tokens'] += len(toks)
+            t_stats['total_normalized_tokens'] += len(norm)
+    
+    def append_tokens_with_ids_chunk(
+        self,
+        split: str,
+        df: 'pd.DataFrame',
+        normalized_list: list,
+        ids_list: list,
+        seq_lengths: list,
+    ) -> None:
+        """Export tokens with IDs to tokens_with_ids.jsonl
+        
+        Shows: normalized tokens, vocabulary IDs, sequence lengths
+        """
+        out_path = self.base_dir / 'tokens_with_ids.jsonl'
+        twi_stats = self.stats['tokens_with_ids'].setdefault(split, {
+            'num_samples': 0,
+            'total_ids': 0,
+        })
+        
+        for (idx, row), norm, ids, sl in zip(df.iterrows(), normalized_list, ids_list, seq_lengths):
+            oov_rate = float(row.get('oov_rate', 0.0)) if pd.notna(row.get('oov_rate')) else 0.0
+            
+            obj = {
+                'id': int(row.get('id', idx)) if pd.notna(row.get('id')) else int(idx),
+                'split': split,
+                'normalized_tokens': norm,
+                'token_ids': ids,
+                'seq_length': sl,
+                'oov_rate': oov_rate,
+            }
+            
+            self._append_line(out_path, obj)
+            twi_stats['num_samples'] += 1
+            twi_stats['total_ids'] += len(ids)
+    
+    def save_stats(self, output_dir: Path, vocab: 'Vocabulary' = None) -> None:
+        """Save build_stats.json and split_info.json"""
+        split_info = self.stats['splits']
+        split_info_path = output_dir / 'split_info.json'
+        with open(split_info_path, 'w', encoding='utf-8') as f:
+            json.dump(split_info, f, indent=2)
+        
+        build_stats = {
+            'splits': split_info,
+            'tokens': self.stats['tokens'],
+            'tokens_with_ids': self.stats['tokens_with_ids'],
+        }
+        if vocab is not None:
+            build_stats['vocab'] = vocab.get_stats()
+        
+        build_stats_path = output_dir / 'build_stats.json'
+        with open(build_stats_path, 'w', encoding='utf-8') as f:
+            json.dump(build_stats, f, indent=2)
+
+
 class PreprocessPipeline:
     """
     End-to-end preprocessing pipeline with checkpointing.
@@ -226,6 +586,14 @@ class PreprocessPipeline:
         
         # Load or create pipeline state
         self.state = self._load_state()
+        
+        # Initialize JSONL exporter if enabled
+        if self.config.export_jsonl:
+            self.jsonl_dir = self.output_dir / self.config.jsonl_subdir
+            self.jsonl_exporter = JsonlExporter(self.jsonl_dir)
+            self.logger.info(f"JSONL export enabled. Output: {self.jsonl_dir}")
+        else:
+            self.jsonl_exporter = None
         
     def _init_components(self) -> None:
         """Initialize all pipeline components (lazy loading)"""
@@ -736,7 +1104,13 @@ class PreprocessPipeline:
                 gc.collect()
     
     def _run_step_slice(self, split: str) -> None:
-        """Step 5: Slice code (requires CFG, DFG)"""
+        """Step 5: Slice code (requires CFG, DFG)
+        
+        Now includes SliceStatistics tracking for monitoring:
+        - Window fallback rate (indicates parser/graph issues)
+        - 1-slice sample rate (indicates forward slicing issues)
+        - Truncation rate (indicates slice_max_len issues)
+        """
         input_chunks = list_chunks(str(self.output_dir), 'dfg', 'parquet')
         
         if not input_chunks:
@@ -744,6 +1118,21 @@ class PreprocessPipeline:
         
         chunk_idx = self._get_resume_chunk('slice', split)
         total_processed = 0
+        
+        # Initialize slice statistics tracker
+        slice_statistics = SliceStatistics()
+        
+        # Try to load existing statistics if resuming
+        stats_path = self.output_dir / f'slice_statistics_{split}.json'
+        if chunk_idx > 0 and stats_path.exists():
+            try:
+                with open(stats_path) as f:
+                    saved_stats = json.load(f)
+                if 'raw_counts' in saved_stats:
+                    slice_statistics = SliceStatistics.from_dict(saved_stats['raw_counts'])
+                    self.logger.info(f"Resumed slice statistics from chunk {chunk_idx}")
+            except Exception as e:
+                self.logger.warning(f"Could not load saved slice statistics: {e}")
         
         for i, chunk_path_str in enumerate(input_chunks):
             if i < chunk_idx:
@@ -791,21 +1180,52 @@ class PreprocessPipeline:
                 # Get precomputed graphs if available
                 cfg = None
                 dfg = None
-                if cfg_objects and row_idx < len(cfg_objects) and cfg_objects[row_idx]:
-                    cfg = deserialize_cfg(cfg_objects[row_idx])
-                if dfg_objects and row_idx < len(dfg_objects) and dfg_objects[row_idx]:
-                    dfg = deserialize_dfg(dfg_objects[row_idx])
+                cfg_failed = False
+                dfg_failed = False
+                
+                if cfg_objects and row_idx < len(cfg_objects):
+                    if cfg_objects[row_idx]:
+                        cfg = deserialize_cfg(cfg_objects[row_idx])
+                    else:
+                        cfg_failed = True
+                        slice_statistics.record_failure('cfg')
+                
+                if dfg_objects and row_idx < len(dfg_objects):
+                    if dfg_objects[row_idx]:
+                        dfg = deserialize_dfg(dfg_objects[row_idx])
+                    else:
+                        dfg_failed = True
+                        slice_statistics.record_failure('dfg')
                 
                 # Perform slicing with precomputed graphs (or rebuild if not available)
                 slice_result = self.slicer.slice(code, criterion_lines, cfg=cfg, dfg=dfg)
                 
+                slice_type_str = slice_result.slice_type.value
+                num_slice_lines = len(slice_result.included_lines)
+                is_empty = not slice_result.code.strip()
+                
+                # Track slice statistics
+                slice_statistics.add_slice(
+                    slice_type=slice_type_str,
+                    num_lines=num_slice_lines,
+                    max_lines=256,
+                    is_empty=is_empty
+                )
+                
                 sliced_codes.append(slice_result.code)
                 slice_stats.append({
-                    'slice_lines': len(slice_result.included_lines),
+                    'slice_lines': num_slice_lines,
                     'original_lines': len(code.split('\n')),
-                    'slice_ratio': len(slice_result.included_lines) / max(1, len(code.split('\n'))),
-                    'slice_type': slice_result.slice_type.value,
+                    'slice_ratio': num_slice_lines / max(1, len(code.split('\n'))),
+                    'slice_type': slice_type_str,
+                    'is_window_fallback': slice_type_str == 'window',
+                    'cfg_available': cfg is not None,
+                    'dfg_available': dfg is not None,
                 })
+            
+            # Track samples (1 slice per sample in this version)
+            for _ in range(len(chunk_df)):
+                slice_statistics.add_sample(num_slices=1)
             
             # Add sliced code and stats
             chunk_df['sliced_code'] = sliced_codes
@@ -816,6 +1236,10 @@ class PreprocessPipeline:
             out_path = chunk_path(str(self.output_dir), 'sliced', i, 'parquet')
             save_chunk(chunk_df, out_path)
             
+            # Export to JSONL if enabled
+            if self.jsonl_exporter is not None:
+                self.jsonl_exporter.append_metadata_chunk(split, chunk_df)
+            
             total_processed += len(chunk_df)
             self._update_step_state(
                 'slice', split,
@@ -824,11 +1248,58 @@ class PreprocessPipeline:
                 samples_processed=total_processed
             )
             
-            self.logger.info(f"Sliced chunk {i}")
+            # Log chunk progress with slice type breakdown
+            chunk_window_count = sum(1 for s in slice_stats if s['slice_type'] == 'window')
+            chunk_window_pct = chunk_window_count / max(1, len(slice_stats)) * 100
+            self.logger.info(
+                f"Sliced chunk {i}: {len(chunk_df)} samples, "
+                f"window_fallback={chunk_window_count} ({chunk_window_pct:.1f}%)"
+            )
+            
+            # Save intermediate statistics (for resume capability)
+            self._save_slice_statistics(slice_statistics, split)
             
             if self.config.gc_after_chunk:
                 del chunk_df, sliced_codes, slice_stats
                 gc.collect()
+        
+        # Save final statistics summary
+        self._save_slice_statistics(slice_statistics, split, final=True)
+        
+        # Log final summary
+        summary = slice_statistics.get_summary()
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"SLICE STATISTICS SUMMARY ({split})")
+        self.logger.info(f"{'='*60}")
+        self.logger.info(f"Total samples: {summary['total_samples']}")
+        self.logger.info(f"Total slices: {summary['total_slices']}")
+        self.logger.info(f"Slice types: {summary['slice_types']}")
+        self.logger.info(f"Window fallback rate: {summary['slice_type_percentages']['window_fallback']:.1f}%")
+        self.logger.info(f"1-slice rate: {summary['quality_metrics']['samples_with_1_slice_rate']:.1f}%")
+        self.logger.info(f"Truncation rate: {summary['quality_metrics']['truncated_rate']:.1f}%")
+        self.logger.info(f"Health status: {summary['health']['status']}")
+        if summary['health']['issues']:
+            self.logger.warning(f"Issues: {summary['health']['issues']}")
+        self.logger.info(f"{'='*60}\n")
+    
+    def _save_slice_statistics(self, stats: SliceStatistics, split: str, 
+                                final: bool = False) -> None:
+        """Save slice statistics to JSON file."""
+        stats_path = self.output_dir / f'slice_statistics_{split}.json'
+        
+        output = {
+            'split': split,
+            'final': final,
+            'timestamp': datetime.now().isoformat(),
+            'raw_counts': stats.to_dict(),
+            'summary': stats.get_summary(),
+        }
+        
+        with open(stats_path, 'w') as f:
+            json.dump(output, f, indent=2)
+        
+        if final:
+            self.logger.info(f"Saved final slice statistics to {stats_path}")
     
     def _run_step_tokenize(self, split: str) -> None:
         """Step 6: Tokenize sliced code"""
@@ -942,6 +1413,12 @@ class PreprocessPipeline:
             out_path = chunk_path(str(self.output_dir), 'normalized_meta', i, 'parquet')
             save_chunk(chunk_df, out_path)
             
+            # Export tokens to JSONL if enabled
+            if self.jsonl_exporter is not None:
+                self.jsonl_exporter.append_tokens_chunk(
+                    split, chunk_df, tokenized_results, normalized_results
+                )
+            
             total_processed += len(chunk_df)
             self._update_step_state(
                 'normalize', split,
@@ -1044,6 +1521,8 @@ class PreprocessPipeline:
             
             vectors = []
             attention_masks = []
+            logical_ids_per_sample = []
+            logical_seq_lengths = []
             
             for tokens in normalized_results:
                 # Convert to indices
@@ -1056,6 +1535,11 @@ class PreprocessPipeline:
                 # Truncate
                 if len(indices) > self.config.max_seq_length:
                     indices = indices[:self.config.max_seq_length]
+                
+                # Save logical (unpadded) ids for JSONL export
+                logical_ids = list(indices)
+                logical_ids_per_sample.append(logical_ids)
+                logical_seq_lengths.append(len(logical_ids))
                 
                 # Create attention mask before padding
                 mask = [1] * len(indices)
@@ -1089,6 +1573,13 @@ class PreprocessPipeline:
             out_path = chunk_path(str(self.output_dir), 'vectorized', i, 'parquet')
             save_chunk(chunk_df, out_path)
             
+            # Export tokens with IDs to JSONL if enabled
+            if self.jsonl_exporter is not None:
+                self.jsonl_exporter.append_tokens_with_ids_chunk(
+                    split, chunk_df, normalized_results,
+                    logical_ids_per_sample, logical_seq_lengths
+                )
+            
             total_processed += len(chunk_df)
             self._update_step_state(
                 'vectorize', split,
@@ -1101,9 +1592,15 @@ class PreprocessPipeline:
             
             if self.config.gc_after_chunk:
                 del normalized_results, vectors, attention_masks, vectors_arr, masks_arr
+                del logical_ids_per_sample, logical_seq_lengths
                 gc.collect()
         
         self.logger.info(f"Vectorization complete: {total_processed} samples")
+        
+        # Save JSONL stats if enabled
+        if self.jsonl_exporter is not None:
+            self.jsonl_exporter.save_stats(self.output_dir, self.vocab)
+            self.logger.info(f"JSONL export stats saved to {self.output_dir}")
     
     def get_status(self) -> Dict[str, Any]:
         """Get current pipeline status"""

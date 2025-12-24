@@ -40,8 +40,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ============================================
 
 # Multi-slice config
-MAX_SLICES = 6          # Max slices per sample (backward + forward)
+# IMPROVED: Reduced from 6 to 4 slices (analysis showed slices 5-6 rarely contribute)
+MAX_SLICES = 4          # Max slices per sample (backward + forward)
 SLICE_MAX_LEN = 256     # Max tokens per slice
+MIN_FORWARD_LINES = 5   # Minimum lines for forward slice before window fallback
 
 # Core C keywords to preserve
 C_KEYWORDS = {
@@ -277,14 +279,16 @@ def process_sample_v2(row, idx: int) -> Optional[Dict[str, Any]]:
         
         # ============================================
         # IMPROVEMENT 1: Multi-slice (backward + forward)
+        # IMPROVED: Now ensures forward slice is never empty
         # ============================================
         slices = []
-        slice_types = []  # 'backward' or 'forward'
+        slice_types = []  # 'backward', 'forward', or 'forward_window'
         
         # Group criterion lines
         groups = group_criterion_lines(criterion_lines)
         
-        for group in groups[:3]:  # Limit groups to avoid too many slices
+        # Limit to 2 groups (will produce 4 slices max = 2 backward + 2 forward)
+        for group in groups[:2]:
             # Backward slice
             try:
                 backward_slice = backward_slicer.slice(code, group)
@@ -294,14 +298,24 @@ def process_sample_v2(row, idx: int) -> Optional[Dict[str, Any]]:
             except Exception:
                 pass
             
-            # Forward slice
+            # Forward slice with fallback
             try:
                 forward_slice = forward_slicer.slice(code, group)
+                forward_lines = len(forward_slice.included_lines) - len(set(group))
+                
+                # Check if forward slice is too small
+                if forward_lines < MIN_FORWARD_LINES or not forward_slice.code.strip():
+                    # Fallback: window-based forward slice
+                    forward_slice = backward_slicer.forward_window_slice(code, group)
+                    slice_type = 'forward_window'
+                else:
+                    slice_type = 'forward'
+                
                 if forward_slice.code and len(forward_slice.code.strip()) > 10:
                     # Avoid duplicate if forward == backward
                     if not slices or forward_slice.code != slices[-1]:
                         slices.append(forward_slice.code)
-                        slice_types.append('forward')
+                        slice_types.append(slice_type)
             except Exception:
                 pass
         
@@ -310,7 +324,7 @@ def process_sample_v2(row, idx: int) -> Optional[Dict[str, Any]]:
             slices = [code]
             slice_types = ['full']
         
-        # Limit to MAX_SLICES
+        # Limit to MAX_SLICES (now 4)
         slices = slices[:MAX_SLICES]
         slice_types = slice_types[:MAX_SLICES]
         
@@ -584,10 +598,13 @@ print(f"  Train vuln features: {train_vuln['features'].shape}")
 print(f"  Train slice vuln features: {train_slice_vuln['slice_vuln_features'].shape}")
 
 # %% Cell 12: Prune Vocabulary
+PRUNE_STATS = {}  # Global variable to store prune statistics
+
 def prune_vocab_and_reindex(vocab: Vocabulary, 
                             vector_sets: List[Dict],
                             slice_vector_sets: List[Dict]) -> Tuple[Vocabulary, List[Dict], List[Dict]]:
     """Prune unused tokens from vocabulary and reindex all vectors."""
+    global PRUNE_STATS
     print("\nPruning vocabulary...")
     
     used_ids = set()
@@ -659,6 +676,12 @@ def prune_vocab_and_reindex(vocab: Vocabulary,
     print(f"  Pruned vocabulary size: {len(new_token2id)}")
     print(f"  Removed {orig_vocab_size - len(new_token2id)} unused tokens")
     
+    PRUNE_STATS = {
+        "original_vocab_size": int(orig_vocab_size),
+        "pruned_vocab_size": int(len(new_token2id)),
+        "removed_tokens": int(orig_vocab_size - len(new_token2id)),
+    }
+    
     return vocab, updated_vector_sets, updated_slice_sets
 
 vocab, (train_vectors, val_vectors, test_vectors), (train_slice_vectors, val_slice_vectors, test_slice_vectors) = prune_vocab_and_reindex(
@@ -666,6 +689,538 @@ vocab, (train_vectors, val_vectors, test_vectors), (train_slice_vectors, val_sli
     [train_vectors, val_vectors, test_vectors],
     [train_slice_vectors, val_slice_vectors, test_slice_vectors]
 )
+
+# %% Cell 12b: Debug JSON/JSONL helpers
+from collections import Counter
+import math
+
+def compute_stats(values):
+    """Compute min, max, mean, percentiles for a list of values."""
+    values = list(values)
+    if not values:
+        return {"min": 0, "max": 0, "mean": 0.0, "p50": 0, "p90": 0, "p95": 0, "p99": 0}
+    v_sorted = sorted(values)
+    n = len(v_sorted)
+
+    def perc(p):
+        idx = int(math.ceil(p * (n - 1)))
+        return int(v_sorted[idx])
+
+    return {
+        "min": int(v_sorted[0]),
+        "max": int(v_sorted[-1]),
+        "mean": round(float(sum(v_sorted) / n), 2),
+        "p50": perc(0.50),
+        "p90": perc(0.90),
+        "p95": perc(0.95),
+        "p99": perc(0.99),
+    }
+
+
+def save_jsonl(path, records):
+    """Save list of dicts to JSONL file."""
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def dump_split_debug(split_name, vectors, slice_vectors, vocab, output_dir):
+    """
+    Generate 4 debug JSON files for each split:
+      1. {split}_overview.json        - High-level metadata and tensor shapes
+      2. {split}_sequences_full.jsonl - Full 512-length sequences with padding
+      3. {split}_slices_full.jsonl    - All 6×256 slices with padding  
+      4. {split}_padding_stats.json   - Aggregate stats and consistency checks
+    Returns stats for vectorization_stats.json.
+    """
+    input_ids = vectors["input_ids"]
+    attn_mask = vectors["attention_mask"]
+    labels = vectors["labels"]
+
+    slice_ids = slice_vectors["slice_input_ids"]
+    slice_attn = slice_vectors["slice_attention_mask"]
+    slice_count_arr = slice_vectors["slice_count"]
+
+    num_samples = input_ids.shape[0]
+    max_len = input_ids.shape[1]
+    max_slices = slice_ids.shape[1]
+    slice_max_len = slice_ids.shape[2]
+
+    pad_id = vocab.pad_id
+    unk_id = vocab.unk_id
+
+    # Collectors for stats
+    seq_lengths = []
+    slice_lengths = []
+    num_slices_per_sample = []
+    slice_count_dist = Counter()
+    
+    token_counter = Counter()
+    id_counter = Counter()
+    total_token_slots = int(num_samples * max_len)
+    total_non_pad_tokens = 0
+    total_pad_tokens = 0
+    total_unk_tokens = 0
+
+    num_truncated_seq = 0
+    num_truncated_slices = 0
+    
+    # Mask consistency checks
+    mask_mismatch_id_zero_mask_one = 0
+    mask_mismatch_id_nonzero_mask_zero = 0
+    
+    # Per-position padding stats
+    seq_nonzero_per_pos = np.zeros(max_len, dtype=np.int64)
+    slice_nonzero_per_pos = np.zeros(slice_max_len, dtype=np.int64)
+    total_real_slices = 0
+
+    sequences_jsonl = []
+    slices_jsonl = []
+
+    for idx in range(num_samples):
+        # === SEQUENCE DATA ===
+        seq_ids_all = input_ids[idx]
+        seq_mask_all = attn_mask[idx]
+        seq_len = int(seq_mask_all.sum())
+        seq_lengths.append(seq_len)
+        pad_len = max_len - seq_len
+        
+        if seq_len == max_len:
+            num_truncated_seq += 1
+
+        # Convert to tokens (full length including padding)
+        seq_tokens_full = [
+            vocab.id2token[i] if i < len(vocab.id2token) else "<invalid>"
+            for i in seq_ids_all
+        ]
+        seq_ids_full = [int(i) for i in seq_ids_all]
+        seq_mask_full = [int(m) for m in seq_mask_all]
+
+        # Count tokens (only non-pad for frequency)
+        for pos, (i, m) in enumerate(zip(seq_ids_all, seq_mask_all)):
+            if i == pad_id:
+                total_pad_tokens += 1
+            else:
+                total_non_pad_tokens += 1
+                seq_nonzero_per_pos[pos] += 1
+                if i == unk_id:
+                    total_unk_tokens += 1
+                token_counter[vocab.id2token[i] if i < len(vocab.id2token) else "<invalid>"] += 1
+                id_counter[int(i)] += 1
+            
+            # Mask consistency
+            if i == pad_id and m == 1:
+                mask_mismatch_id_zero_mask_one += 1
+            if i != pad_id and m == 0:
+                mask_mismatch_id_nonzero_mask_zero += 1
+
+        # === SLICE DATA ===
+        sample_slice_count = int(slice_count_arr[idx])
+        num_slices_per_sample.append(sample_slice_count)
+        slice_count_dist[sample_slice_count] += 1
+
+        sample_slices = []
+        for s in range(max_slices):
+            s_ids_all = slice_ids[idx, s]
+            s_mask_all = slice_attn[idx, s]
+            s_len = int(s_mask_all.sum())
+            s_pad_len = slice_max_len - s_len
+            
+            is_real = s < sample_slice_count
+            
+            if is_real:
+                slice_lengths.append(s_len)
+                total_real_slices += 1
+                if s_len == slice_max_len:
+                    num_truncated_slices += 1
+                # Per-position stats for real slices
+                for pos, i in enumerate(s_ids_all):
+                    if i != pad_id:
+                        slice_nonzero_per_pos[pos] += 1
+
+            s_tokens_full = [
+                vocab.id2token[i] if i < len(vocab.id2token) else "<invalid>"
+                for i in s_ids_all
+            ]
+            s_ids_full = [int(i) for i in s_ids_all]
+            s_mask_full = [int(m) for m in s_mask_all]
+
+            sample_slices.append({
+                "slice_id": s,
+                "is_real_slice": is_real,
+                "max_len": slice_max_len,
+                "nonpad_len": s_len if is_real else 0,
+                "pad_len": s_pad_len if is_real else slice_max_len,
+                "input_ids": s_ids_full,
+                "attention_mask": s_mask_full,
+                "tokens": s_tokens_full,
+            })
+
+        # Build sequence record
+        seq_record = {
+            "sample_id": idx,
+            "label": int(labels[idx]),
+            "sequence": {
+                "max_len": max_len,
+                "nonpad_len": seq_len,
+                "pad_len": pad_len,
+                "input_ids": seq_ids_full,
+                "attention_mask": seq_mask_full,
+                "tokens": seq_tokens_full,
+            },
+        }
+        sequences_jsonl.append(seq_record)
+
+        # Build slices record
+        slices_record = {
+            "sample_id": idx,
+            "label": int(labels[idx]),
+            "slice_count": sample_slice_count,
+            "slices": sample_slices,
+        }
+        slices_jsonl.append(slices_record)
+
+    # === FILE 1: Overview JSON ===
+    overview = {
+        "split": split_name,
+        "num_samples": num_samples,
+        "max_sequence_length": max_len,
+        "max_slices_per_sample": max_slices,
+        "max_slice_length": slice_max_len,
+        "labels": {
+            "num_classes": 2,
+            "mapping": {"0": "non_vulnerable", "1": "vulnerable"},
+            "distribution": {
+                "0": int((labels == 0).sum()),
+                "1": int((labels == 1).sum()),
+            },
+        },
+        "tensors": {
+            "input_ids": {
+                "shape": list(input_ids.shape),
+                "dtype": str(input_ids.dtype),
+                "description": "Token IDs for full sequence; padded with 0.",
+            },
+            "attention_mask": {
+                "shape": list(attn_mask.shape),
+                "dtype": str(attn_mask.dtype),
+                "description": "1 for real tokens, 0 for padding.",
+            },
+            "labels": {
+                "shape": list(labels.shape),
+                "dtype": str(labels.dtype),
+            },
+            "slice_input_ids": {
+                "shape": list(slice_ids.shape),
+                "dtype": str(slice_ids.dtype),
+            },
+            "slice_attention_mask": {
+                "shape": list(slice_attn.shape),
+                "dtype": str(slice_attn.dtype),
+            },
+            "slice_count": {
+                "shape": list(slice_count_arr.shape),
+                "dtype": str(slice_count_arr.dtype),
+                "description": f"Number of real slices per sample (≤ {max_slices}).",
+            },
+        },
+        "special_tokens": {
+            "pad": {"id": int(pad_id), "token": "<PAD>"},
+            "unk": {"id": int(unk_id), "token": "<UNK>"},
+            "bos": {"id": int(vocab.bos_id), "token": "<BOS>"},
+            "eos": {"id": int(vocab.eos_id), "token": "<EOS>"},
+        },
+    }
+
+    with open(os.path.join(output_dir, f"{split_name}_overview.json"), "w", encoding="utf-8") as f:
+        json.dump(overview, f, indent=2, ensure_ascii=False)
+
+    # === FILE 2: Sequences JSONL ===
+    save_jsonl(os.path.join(output_dir, f"{split_name}_sequences_full.jsonl"), sequences_jsonl)
+
+    # === FILE 3: Slices JSONL ===
+    save_jsonl(os.path.join(output_dir, f"{split_name}_slices_full.jsonl"), slices_jsonl)
+
+    # === FILE 4: Padding Stats JSON ===
+    # Compute histogram bins for sequence lengths
+    hist_bins = [0, 64, 128, 192, 256, 320, 384, 448, 512]
+    seq_hist_counts = [0] * (len(hist_bins) - 1)
+    for sl in seq_lengths:
+        for i in range(len(hist_bins) - 1):
+            if hist_bins[i] <= sl < hist_bins[i + 1]:
+                seq_hist_counts[i] += 1
+                break
+        else:
+            seq_hist_counts[-1] += 1
+
+    unk_ratio = float(total_unk_tokens) / max(total_non_pad_tokens, 1)
+    
+    padding_stats = {
+        "split": split_name,
+        "sequence_lengths": {
+            "min": int(min(seq_lengths)) if seq_lengths else 0,
+            "max": int(max(seq_lengths)) if seq_lengths else 0,
+            "mean": round(float(np.mean(seq_lengths)), 2) if seq_lengths else 0,
+            "median": int(np.median(seq_lengths)) if seq_lengths else 0,
+            "histogram": {
+                "bins": hist_bins,
+                "counts": seq_hist_counts,
+            },
+        },
+        "slice_lengths": {
+            "real_slices_only": {
+                "count": len(slice_lengths),
+                "min": int(min(slice_lengths)) if slice_lengths else 0,
+                "max": int(max(slice_lengths)) if slice_lengths else 0,
+                "mean": round(float(np.mean(slice_lengths)), 2) if slice_lengths else 0,
+            },
+        },
+        "slice_count_distribution": {str(k): v for k, v in sorted(slice_count_dist.items())},
+        "padding_summary": {
+            "total_sequence_slots": total_token_slots,
+            "total_non_pad_tokens": total_non_pad_tokens,
+            "total_pad_tokens": total_pad_tokens,
+            "sequence_pad_fraction": round(float(total_pad_tokens / max(total_token_slots, 1)), 4),
+            "total_unk_tokens": total_unk_tokens,
+            "unk_ratio": round(unk_ratio, 6),
+        },
+        "mask_consistency": {
+            "id_zero_but_mask_one": mask_mismatch_id_zero_mask_one,
+            "id_nonzero_but_mask_zero": mask_mismatch_id_nonzero_mask_zero,
+            "is_consistent": mask_mismatch_id_zero_mask_one == 0 and mask_mismatch_id_nonzero_mask_zero == 0,
+        },
+        "truncation": {
+            "num_truncated_sequences": num_truncated_seq,
+            "num_truncated_slices": num_truncated_slices,
+        },
+        "token_frequency_top20": [
+            {"rank": i+1, "token": tok, "count": cnt}
+            for i, (tok, cnt) in enumerate(token_counter.most_common(20))
+        ],
+        "id_frequency_top20": [
+            {"rank": i+1, "id": int(i_id), "token": vocab.id2token[i_id] if i_id < len(vocab.id2token) else "<invalid>", "count": cnt}
+            for i, (i_id, cnt) in enumerate(id_counter.most_common(20))
+        ],
+    }
+
+    with open(os.path.join(output_dir, f"{split_name}_padding_stats.json"), "w", encoding="utf-8") as f:
+        json.dump(padding_stats, f, indent=2, ensure_ascii=False)
+
+    # Return stats for vectorization_stats.json
+    split_vec_stats = {
+        "num_samples": num_samples,
+        "seq_length": compute_stats(seq_lengths),
+        "num_truncated_seq": num_truncated_seq,
+        "seq_pad_fraction": round(float(total_pad_tokens / max(total_token_slots, 1)), 4),
+        "slice_length": compute_stats(slice_lengths),
+        "num_truncated_slices": num_truncated_slices,
+        "slice_pad_fraction": round(float(
+            (slice_ids.size - int(np.count_nonzero(slice_attn)))
+            / max(slice_ids.size, 1)
+        ), 4),
+    }
+    return split_vec_stats
+
+
+def compute_feature_stats(arr: np.ndarray) -> Dict[str, Any]:
+    """Compute statistics for a 1D feature array."""
+    arr = arr.astype(float)
+    return {
+        "mean": round(float(np.mean(arr)), 4),
+        "std": round(float(np.std(arr)), 4),
+        "min": round(float(np.min(arr)), 4),
+        "p25": round(float(np.percentile(arr, 25)), 4),
+        "median": round(float(np.median(arr)), 4),
+        "p75": round(float(np.percentile(arr, 75)), 4),
+        "max": round(float(np.max(arr)), 4),
+        "num_nonzero": int(np.count_nonzero(arr)),
+        "num_zero": int(np.sum(arr == 0)),
+    }
+
+
+def dump_vuln_debug(split_name: str, vuln_data: Dict, slice_vuln_data: Dict, output_dir: str):
+    """
+    Generate 4 debug JSON files for vulnerability features:
+      1. {split}_vuln_features_stats.json     - Stats for global features
+      2. {split}_vuln_slice_features_stats.json - Stats for slice vuln features
+      3. {split}_vuln_slice_rel_stats.json    - Stats for slice relative features
+      4. {split}_vuln_debug_samples.jsonl     - Per-sample feature values
+    """
+    features = vuln_data["features"]  # (num_samples, 26)
+    feature_names = list(vuln_data["feature_names"])
+    
+    slice_vuln_features = slice_vuln_data["slice_vuln_features"]  # (num_samples, 6, 26)
+    slice_rel_features = slice_vuln_data["slice_rel_features"]    # (num_samples, 6, 26)
+    slice_vuln_names = list(slice_vuln_data["slice_vuln_feature_names"])
+    slice_rel_names = list(slice_vuln_data["slice_rel_feature_names"])
+    
+    num_samples = features.shape[0]
+    num_slices = slice_vuln_features.shape[1]
+    num_features = features.shape[1]
+    
+    # === FILE 1: Global features stats ===
+    features_stats = {
+        "split": split_name,
+        "num_samples": num_samples,
+        "num_features": num_features,
+        "array": "features",
+        "feature_stats": {}
+    }
+    for i, fname in enumerate(feature_names):
+        features_stats["feature_stats"][fname] = compute_feature_stats(features[:, i])
+    
+    with open(os.path.join(output_dir, f"{split_name}_vuln_features_stats.json"), "w", encoding="utf-8") as f:
+        json.dump(features_stats, f, indent=2, ensure_ascii=False)
+    
+    # === FILE 2: Slice vuln features stats ===
+    slice_vuln_stats = {
+        "split": split_name,
+        "num_samples": num_samples,
+        "num_slices": num_slices,
+        "num_features": num_features,
+        "array": "slice_vuln_features",
+        "feature_stats": {}
+    }
+    for i, fname in enumerate(slice_vuln_names):
+        # Overall stats (all slices pooled)
+        all_vals = slice_vuln_features[:, :, i].flatten()
+        overall = compute_feature_stats(all_vals)
+        
+        # Per-slice stats
+        per_slice = {}
+        for s in range(num_slices):
+            per_slice[str(s)] = compute_feature_stats(slice_vuln_features[:, s, i])
+        
+        slice_vuln_stats["feature_stats"][fname] = {
+            "overall": overall,
+            "per_slice": per_slice,
+        }
+    
+    with open(os.path.join(output_dir, f"{split_name}_vuln_slice_features_stats.json"), "w", encoding="utf-8") as f:
+        json.dump(slice_vuln_stats, f, indent=2, ensure_ascii=False)
+    
+    # === FILE 3: Slice relative features stats ===
+    slice_rel_stats = {
+        "split": split_name,
+        "num_samples": num_samples,
+        "num_slices": num_slices,
+        "num_features": num_features,
+        "array": "slice_rel_features",
+        "feature_stats": {}
+    }
+    for i, fname in enumerate(slice_rel_names):
+        all_vals = slice_rel_features[:, :, i].flatten()
+        overall = compute_feature_stats(all_vals)
+        
+        per_slice = {}
+        for s in range(num_slices):
+            per_slice[str(s)] = compute_feature_stats(slice_rel_features[:, s, i])
+        
+        slice_rel_stats["feature_stats"][fname] = {
+            "overall": overall,
+            "per_slice": per_slice,
+        }
+    
+    with open(os.path.join(output_dir, f"{split_name}_vuln_slice_rel_stats.json"), "w", encoding="utf-8") as f:
+        json.dump(slice_rel_stats, f, indent=2, ensure_ascii=False)
+    
+    # === FILE 4: Per-sample debug JSONL ===
+    samples_jsonl = []
+    for idx in range(num_samples):
+        # Global features
+        global_feats = {fname: round(float(features[idx, i]), 4) for i, fname in enumerate(feature_names)}
+        
+        # Slice vuln features
+        slice_vuln_list = []
+        for s in range(num_slices):
+            s_feats = {"slice_id": s}
+            for i, fname in enumerate(slice_vuln_names):
+                s_feats[fname] = round(float(slice_vuln_features[idx, s, i]), 4)
+            slice_vuln_list.append(s_feats)
+        
+        # Slice rel features
+        slice_rel_list = []
+        for s in range(num_slices):
+            s_feats = {"slice_id": s}
+            for i, fname in enumerate(slice_rel_names):
+                s_feats[fname] = round(float(slice_rel_features[idx, s, i]), 4)
+            slice_rel_list.append(s_feats)
+        
+        samples_jsonl.append({
+            "sample_id": idx,
+            "features": global_feats,
+            "slice_vuln_features": slice_vuln_list,
+            "slice_rel_features": slice_rel_list,
+        })
+    
+    save_jsonl(os.path.join(output_dir, f"{split_name}_vuln_debug_samples.jsonl"), samples_jsonl)
+    
+    print(f"  ✓ {split_name}_vuln: 4 debug files saved")
+
+
+def build_vocab_debug(vocab, prune_stats):
+    """Build vocab_debug.json content."""
+    freqs = vocab.token_freqs if hasattr(vocab, "token_freqs") else {}
+    freq_items = list(freqs.items())
+    freq_items.sort(key=lambda x: x[1], reverse=True)
+    most = freq_items[:100]
+    least = freq_items[-100:]
+
+    return {
+        "version": "v2",
+        "vocab_size": int(len(vocab)),
+        "prune_stats": prune_stats,
+        "special_tokens": {
+            "pad": {"id": int(vocab.pad_id), "token": vocab.id2token[vocab.pad_id]},
+            "unk": {"id": int(vocab.unk_id), "token": vocab.id2token[vocab.unk_id]},
+            "bos": {"id": int(vocab.bos_id), "token": vocab.id2token[vocab.bos_id]},
+            "eos": {"id": int(vocab.eos_id), "token": vocab.id2token[vocab.eos_id]},
+        },
+        "most_frequent_tokens": [
+            {"token": tok, "id": int(vocab.token2id.get(tok, -1)), "freq": int(c)}
+            for tok, c in most
+        ],
+        "least_frequent_tokens": [
+            {"token": tok, "id": int(vocab.token2id.get(tok, -1)), "freq": int(c)}
+            for tok, c in least
+        ],
+    }
+
+
+# %% Cell 12c: Dump debug JSON/JSONL (before creating .npz)
+print("\nSaving intermediate debug JSON/JSONL...")
+
+vectorization_stats = {
+    "version": "v2",
+    "max_len": int(MAX_LEN),
+    "max_slices": int(MAX_SLICES),
+    "slice_max_len": int(SLICE_MAX_LEN),
+    "splits": {},
+}
+
+for split_name, vec, s_vec in [
+    ("train", train_vectors, train_slice_vectors),
+    ("val",   val_vectors,   val_slice_vectors),
+    ("test",  test_vectors,  test_slice_vectors),
+]:
+    print(f"  Processing {split_name}...")
+    split_stats = dump_split_debug(split_name, vec, s_vec, vocab, OUTPUT_DIR)
+    vectorization_stats["splits"][split_name] = split_stats
+
+with open(os.path.join(OUTPUT_DIR, "vectorization_stats.json"), "w", encoding="utf-8") as f:
+    json.dump(vectorization_stats, f, indent=2, ensure_ascii=False)
+
+vocab_debug = build_vocab_debug(vocab, PRUNE_STATS)
+with open(os.path.join(OUTPUT_DIR, "vocab_debug.json"), "w", encoding="utf-8") as f:
+    json.dump(vocab_debug, f, indent=2, ensure_ascii=False)
+
+print("✓ Debug files saved:")
+print(f"  - {{train,val,test}}_overview.json")
+print(f"  - {{train,val,test}}_sequences_full.jsonl")
+print(f"  - {{train,val,test}}_slices_full.jsonl")
+print(f"  - {{train,val,test}}_padding_stats.json")
+print(f"  - vectorization_stats.json")
+print(f"  - vocab_debug.json")
 
 # %% Cell 13: Save Outputs
 print("\nSaving outputs...")
@@ -697,6 +1252,12 @@ np.savez_compressed(f'{OUTPUT_DIR}/test_vuln.npz',
     **test_vuln,
     **test_slice_vuln,
 )
+
+# NEW: Dump vuln debug files
+print("\nSaving vuln debug files...")
+dump_vuln_debug("train", train_vuln, train_slice_vuln, OUTPUT_DIR)
+dump_vuln_debug("val", val_vuln, val_slice_vuln, OUTPUT_DIR)
+dump_vuln_debug("test", test_vuln, test_slice_vuln, OUTPUT_DIR)
 
 # Save vocabulary
 vocab.save(f'{OUTPUT_DIR}/vocab.json')

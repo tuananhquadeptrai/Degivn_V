@@ -16,20 +16,26 @@ from tqdm.auto import tqdm
 
 # Config paths
 if os.path.exists('/kaggle'):
-    DATA_DIR = '/kaggle/input/devign-v2-processed/processed'
-    MODEL_DIR = '/kaggle/working/models'
+    DATA_DIR = '/kaggle/input/outputdata/Output data'
+    OUTPUT_DIR = '/kaggle/working/output'
 else:
-    DATA_DIR = '/media/tuananh/새 볼륨/DACNANM/Devign/C-Vul-Devign/Output data/results/processed'
-    MODEL_DIR = './models'
+    DATA_DIR = '/media/tuananh/새 볼륨/DACNANM/Devign/C-Vul-Devign/Output data'
+    OUTPUT_DIR = './output'
+
+MODEL_DIR = f'{OUTPUT_DIR}/models'
+PLOTS_DIR = f'{OUTPUT_DIR}/plots'
 
 os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(PLOTS_DIR, exist_ok=True)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {DEVICE}, GPUs: {torch.cuda.device_count()}")
 
 # ===== CONFIGURATION =====
-NUM_SEEDS = 3  # Multi-seed ensemble (set to 1 for single model)
+NUM_SEEDS = 1  # Single model (set to 3 for multi-seed ensemble)
 POS_WEIGHT_SCALE = 1.12  # Oracle recommendation: 1.08-1.16
-GATE_INIT = 0.3  # Initial gate strength (bounded)
+GATE_INIT = 0.4  # Initial gate strength (bounded) - increased for feature gating
+FOCAL_GAMMA = 2.0  # Focal loss gamma (range 1.5-3.0, higher = more focus on hard examples)
+FOCAL_ALPHA_SCALE = 1.0  # Multiplier for focal loss alpha
 
 # Load config
 with open(f'{DATA_DIR}/config.json') as f:
@@ -101,6 +107,10 @@ class HierarchicalBiGRU(nn.Module):
         self.slice_gru = nn.GRU(embed_dim, slice_hidden, bidirectional=True, batch_first=True)
         self.slice_attn = nn.Sequential(nn.Linear(slice_hidden*2, slice_hidden), nn.Tanh(), nn.Linear(slice_hidden, 1))
         
+        # Slice-sequence BiGRU for inter-slice dependencies (Oracle improvement)
+        self.slice_seq_gru = nn.GRU(slice_hidden*2, slice_hidden, bidirectional=True, batch_first=True)
+        self.slice_seq_attn = nn.Sequential(nn.Linear(slice_hidden*2, slice_hidden), nn.Tanh(), nn.Linear(slice_hidden, 1))
+        
         # Slice feature fusion (concat+MLP)
         self.slice_feat_mlp = nn.Sequential(nn.Linear(slice_feat_dim, 128), nn.LayerNorm(128), nn.GELU(), nn.Dropout(0.2))
         self.slice_fusion = nn.Sequential(
@@ -114,11 +124,11 @@ class HierarchicalBiGRU(nn.Module):
         self.vuln_dim = vuln_dim
         self.vuln_mlp = nn.Sequential(nn.BatchNorm1d(vuln_dim), nn.Linear(vuln_dim, 64), nn.GELU(), nn.Dropout(0.2))
         
-        # Symmetric defense-aware gating (Oracle improvement: allows both increase/decrease)
-        self.defense_gate = nn.Sequential(
+        # Feature-level gating over vuln representation (Oracle improvement: replaces logit-shift)
+        self.feature_gate = nn.Sequential(
             nn.Linear(64, 32),
             nn.GELU(),
-            nn.Linear(32, 1),
+            nn.Linear(32, 64),
             nn.Sigmoid()
         )
         # Bounded gate strength: sigmoid keeps it in (0, 1)
@@ -154,25 +164,35 @@ class HierarchicalBiGRU(nn.Module):
             slice_repr = self.slice_fusion(torch.cat([slice_repr, feat], dim=-1))
         
         s_mask = torch.arange(S, device=slice_count.device).expand(B,S) < slice_count.unsqueeze(1)
+        
+        # Existing slice-level attention (bag-of-slices summary)
         s_scores = self.slice_level_attn(slice_repr).masked_fill(~s_mask.unsqueeze(-1), -65000.0)
-        return (slice_repr * F.softmax(s_scores, dim=1)).sum(dim=1)
+        slice_attn_repr = (slice_repr * F.softmax(s_scores, dim=1)).sum(dim=1)  # [B, 2*slice_hidden]
+        
+        # New BiGRU over the slice sequence (Oracle improvement: inter-slice dependencies)
+        slice_repr_masked = slice_repr * s_mask.unsqueeze(-1).float()
+        seq_out, _ = self.slice_seq_gru(slice_repr_masked)  # [B, S, 2*slice_hidden]
+        seq_scores = self.slice_seq_attn(seq_out).masked_fill(~s_mask.unsqueeze(-1), -65000.0)
+        slice_seq_repr = (seq_out * F.softmax(seq_scores, dim=1)).sum(dim=1)  # [B, 2*slice_hidden]
+        
+        # Combine orderless + sequential views
+        return 0.5 * (slice_attn_repr + slice_seq_repr)
     
     def forward(self, input_ids, attention_mask, slice_input_ids=None, slice_attention_mask=None, 
                 slice_count=None, vuln_features=None, slice_vuln_features=None, slice_rel_features=None, **kw):
         g = self.encode_global(input_ids, attention_mask)
         s = self.encode_slices(slice_input_ids, slice_attention_mask, slice_count, slice_vuln_features, slice_rel_features) if slice_input_ids is not None else torch.zeros(g.size(0), self.slice_hidden*2, device=g.device)
-        v = self.vuln_mlp(vuln_features) if vuln_features is not None else torch.zeros(g.size(0), 64, device=g.device)
+        
+        # Feature-level gating (Oracle improvement: modulates vuln features directly instead of logit-shift)
+        if vuln_features is not None:
+            v = self.vuln_mlp(vuln_features)  # [B, 64]
+            gate = self.feature_gate(v)  # [B, 64] in (0, 1)
+            v = v * (1.0 + self.gate_strength * (gate - 0.5))  # Symmetric modulation
+        else:
+            v = torch.zeros(g.size(0), 64, device=g.device)
         
         h = torch.cat([g, s, v], dim=1)
         logits = self.classifier(h)
-        
-        # Symmetric gating: (gate - 0.5) allows both positive and negative adjustment
-        if vuln_features is not None:
-            gate = self.defense_gate(v).squeeze(-1)  # [B], in (0, 1)
-            delta = self.gate_strength * (gate - 0.5)  # Symmetric around 0
-            logits = logits.clone()
-            logits[:, 0] = logits[:, 0] + delta  # Push toward negative when gate > 0.5
-            logits[:, 1] = logits[:, 1] - delta  # Push toward positive when gate < 0.5
         
         return logits
 
@@ -183,6 +203,20 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+# Focal Loss (Oracle improvement: emphasizes hard examples)
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        alpha_t = torch.where(targets == 1, self.alpha, 1.0 - self.alpha)
+        loss = alpha_t * (1.0 - pt) ** self.gamma * ce_loss
+        return loss.mean()
 
 def train_epoch(model, loader, criterion, optimizer, scaler):
     model.train()
@@ -252,7 +286,11 @@ def train_single_model(seed, train_ds, val_ds, n_neg, n_pos, data_config):
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} params")
     
     pos_weight = (n_neg / n_pos) * POS_WEIGHT_SCALE
-    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, pos_weight], dtype=torch.float32, device=DEVICE), label_smoothing=0.0)
+    # Focal Loss (Oracle improvement: focuses on hard examples, reduces FN)
+    pos_ratio = n_pos / (n_pos + n_neg)
+    alpha_pos = (1.0 - pos_ratio) * FOCAL_ALPHA_SCALE  # More weight on minority class
+    criterion = FocalLoss(alpha=alpha_pos, gamma=FOCAL_GAMMA).to(DEVICE)
+    print(f"Using Focal Loss: alpha={alpha_pos:.3f}, gamma={FOCAL_GAMMA}")
     optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=2, factor=0.5)
     scaler = GradScaler()
@@ -266,7 +304,7 @@ def train_single_model(seed, train_ds, val_ds, n_neg, n_pos, data_config):
         val_m = evaluate(model, val_loader, criterion)
         scheduler.step(val_m['opt_f1'])
         print(f"Train: loss={train_m['loss']:.4f}, F1={train_m['f1']:.4f}, AUC={train_m['auc']:.4f}")
-        print(f"Val: F1={val_m['f1']:.4f}, AUC={val_m['auc']:.4f}, OptF1={val_m['opt_f1']:.4f}, Prec={val_m['opt_prec']:.4f}, Rec={val_m['opt_rec']:.4f}")
+        print(f"Val: loss={val_m['loss']:.4f}, F1={val_m['f1']:.4f}, AUC={val_m['auc']:.4f}, OptF1={val_m['opt_f1']:.4f}, Prec={val_m['opt_prec']:.4f}, Rec={val_m['opt_rec']:.4f}")
         if val_m['opt_f1'] > best_f1:
             best_f1 = val_m['opt_f1']; patience = 0
             torch.save(model.state_dict(), model_path)
@@ -276,7 +314,7 @@ def train_single_model(seed, train_ds, val_ds, n_neg, n_pos, data_config):
             if patience >= 6: print("Early stop!"); break
     
     # Load best model
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path, weights_only=False))
     return model, best_f1
 
 # ===== MAIN TRAINING LOOP =====
@@ -365,9 +403,9 @@ axes[1].set_title(f'Confusion Matrix (t={best_t:.2f})\nOptF1={test_f1_opt:.4f}')
 axes[1].set_xlabel('Predicted'); axes[1].set_ylabel('Actual')
 
 plt.tight_layout()
-plt.savefig(f'{MODEL_DIR}/confusion_matrix.png', dpi=150)
+plt.savefig(f'{PLOTS_DIR}/confusion_matrix.png', dpi=150)
 plt.show()
-print(f"Saved confusion matrix to {MODEL_DIR}/confusion_matrix.png")
+print(f"Saved confusion matrix to {PLOTS_DIR}/confusion_matrix.png")
 
 # Save ensemble config
 ensemble_config = {
@@ -381,6 +419,66 @@ ensemble_config = {
     'test_recall': float(test_rec),
     'test_auc': float(test_auc)
 }
-with open(f'{MODEL_DIR}/ensemble_config.json', 'w') as f:
+with open(f'{OUTPUT_DIR}/ensemble_config.json', 'w') as f:
     json.dump(ensemble_config, f, indent=2)
-print(f"Saved ensemble config to {MODEL_DIR}/ensemble_config.json")
+print(f"Saved ensemble config to {OUTPUT_DIR}/ensemble_config.json")
+
+# ===== ADDITIONAL PLOTS =====
+from sklearn.metrics import roc_curve, precision_recall_curve, auc
+
+# ROC Curve
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+fpr, tpr, _ = roc_curve(test_labels, test_probs_cal)
+roc_auc = auc(fpr, tpr)
+axes[0].plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+axes[0].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', alpha=0.5)
+axes[0].set_xlim([0.0, 1.0])
+axes[0].set_ylim([0.0, 1.05])
+axes[0].set_xlabel('False Positive Rate', fontsize=12)
+axes[0].set_ylabel('True Positive Rate', fontsize=12)
+axes[0].set_title('ROC Curve', fontsize=14, fontweight='bold')
+axes[0].legend(loc="lower right")
+axes[0].grid(True, alpha=0.3)
+
+# Precision-Recall Curve
+precision, recall, _ = precision_recall_curve(test_labels, test_probs_cal)
+pr_auc = auc(recall, precision)
+axes[1].plot(recall, precision, color='green', lw=2, label=f'PR curve (AUC = {pr_auc:.4f})')
+axes[1].axhline(y=test_prec, color='red', linestyle='--', alpha=0.5, label=f'Precision @ opt_t={test_prec:.4f}')
+axes[1].set_xlim([0.0, 1.0])
+axes[1].set_ylim([0.0, 1.05])
+axes[1].set_xlabel('Recall', fontsize=12)
+axes[1].set_ylabel('Precision', fontsize=12)
+axes[1].set_title('Precision-Recall Curve', fontsize=14, fontweight='bold')
+axes[1].legend(loc="lower left")
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f'{PLOTS_DIR}/roc_pr_curves.png', dpi=150)
+plt.show()
+print(f"Saved ROC & PR curves to {PLOTS_DIR}/roc_pr_curves.png")
+
+# Metrics Summary
+fig, ax = plt.subplots(figsize=(10, 6))
+metrics_names = ['F1 (t=0.5)', 'F1 (optimal)', 'Precision', 'Recall', 'AUC']
+metrics_values = [test_f1_05, test_f1_opt, test_prec, test_rec, test_auc]
+colors = ['#3498db', '#2ecc71', '#9b59b6', '#e74c3c', '#f39c12']
+bars = ax.bar(metrics_names, metrics_values, color=colors, edgecolor='black', linewidth=1.2)
+for bar, val in zip(bars, metrics_values):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, f'{val:.4f}', 
+            ha='center', va='bottom', fontsize=12, fontweight='bold')
+ax.set_ylim(0, 1.1)
+ax.set_ylabel('Score', fontsize=12)
+ax.set_title(f'Test Metrics Summary (Ensemble + Calibration, t={best_t:.2f})', fontsize=14, fontweight='bold')
+ax.grid(axis='y', alpha=0.3)
+plt.tight_layout()
+plt.savefig(f'{PLOTS_DIR}/metrics_summary.png', dpi=150)
+plt.show()
+print(f"Saved metrics summary to {PLOTS_DIR}/metrics_summary.png")
+
+print(f"\n{'='*60}")
+print(f"All outputs saved to: {OUTPUT_DIR}")
+print(f"  - Models: {MODEL_DIR}/")
+print(f"  - Plots: {PLOTS_DIR}/")
+print(f"{'='*60}")

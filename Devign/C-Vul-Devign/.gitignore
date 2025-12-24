@@ -1,5 +1,17 @@
 __pycache__/
 *.pyc
-output /
 venv/
 *.log
+
+# Large data files (>100MB) - keep on Kaggle dataset only
+Output data/*.jsonl
+Output data/*.npz
+Output data/*.npy
+Output data/results/
+Output/
+output/
+
+# Model checkpoints
+*.pt
+checkpoints/
+checkpoints_v2/

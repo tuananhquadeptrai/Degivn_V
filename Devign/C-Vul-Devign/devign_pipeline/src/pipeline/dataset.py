@@ -95,6 +95,7 @@ class DevignDataset:
         all_labels = []
         all_lengths = []
         all_sample_ids = []
+        all_slice_masks = []
         
         for path in self.vector_paths:
             data = np.load(path, allow_pickle=True)
@@ -106,6 +107,8 @@ class DevignDataset:
                 all_labels.append(data['labels'])
             if 'sample_ids' in data:
                 all_sample_ids.append(data['sample_ids'])
+            if 'slice_mask' in data:
+                all_slice_masks.append(data['slice_mask'])
                 
         self.data = {
             'input_ids': np.concatenate(all_input_ids),
@@ -117,6 +120,8 @@ class DevignDataset:
             self.data['labels'] = np.concatenate(all_labels)
         if all_sample_ids:
             self.data['sample_ids'] = np.concatenate(all_sample_ids)
+        if all_slice_masks:
+            self.data['slice_mask'] = np.concatenate(all_slice_masks)
             
     def _get_file_data(self, path: str) -> Dict[str, np.ndarray]:
         """Get file data with LRU caching."""
@@ -162,6 +167,8 @@ class DevignDataset:
                 result['label'] = self.data['labels'][idx]
             if 'lengths' in self.data:
                 result['length'] = self.data['lengths'][idx]
+            if 'slice_mask' in self.data:
+                result['slice_mask'] = self.data['slice_mask'][idx]
             return result
             
         path, local_idx = self._find_file_for_idx(idx)
@@ -175,6 +182,8 @@ class DevignDataset:
             result['label'] = file_data['labels'][local_idx]
         if 'lengths' in file_data:
             result['length'] = file_data['lengths'][local_idx]
+        if 'slice_mask' in file_data:
+            result['slice_mask'] = file_data['slice_mask'][local_idx]
             
         return result
         

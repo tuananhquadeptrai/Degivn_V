@@ -96,7 +96,13 @@ class DFG:
 
 
 class DFGBuilder:
-    """Build Data Flow Graph from parsed C/C++ code"""
+    """Build Data Flow Graph from parsed C/C++ code.
+    
+    Improvements:
+    - Increased default scope_limit from 50 to 150 lines to capture
+      long-range data dependencies that may be missed with smaller scope.
+    - Added build_full_function option to analyze entire function body.
+    """
     
     DEF_NODE_TYPES = {
         'declaration', 'init_declarator', 'parameter_declaration',
@@ -109,19 +115,42 @@ class DFGBuilder:
     
     POINTER_OPS = {'pointer_expression', 'address_of_expression'}
     
-    def __init__(self, scope_limit: int = 50):
-        self.scope_limit = scope_limit
+    # Increased from 50 to 150 to capture long-range dependencies
+    DEFAULT_SCOPE_LIMIT = 150
+    
+    def __init__(self, scope_limit: int = None, build_full_function: bool = False):
+        """Initialize DFGBuilder.
+        
+        Args:
+            scope_limit: Number of lines before/after focus_lines to include.
+                        Default is 150 (increased from 50 for better coverage).
+            build_full_function: If True, ignores scope_limit and builds DFG
+                                for entire function body.
+        """
+        self.scope_limit = scope_limit if scope_limit is not None else self.DEFAULT_SCOPE_LIMIT
+        self.build_full_function = build_full_function
         self._current_parse: Optional[ParseResult] = None
 
     def build(self, parse_result: ParseResult, 
               focus_lines: Optional[List[int]] = None) -> Optional[DFG]:
-        """Build DFG from ParseResult"""
+        """Build DFG from ParseResult.
+        
+        Args:
+            parse_result: Parsed AST
+            focus_lines: Lines to focus on. DFG will be built for 
+                        ±scope_limit lines around these lines.
+                        If build_full_function=True, this is ignored.
+        """
         if not parse_result.nodes:
             return None
         
         self._current_parse = parse_result
         
-        if focus_lines:
+        if self.build_full_function:
+            # Build DFG for entire code
+            min_line = 0
+            max_line = 99999
+        elif focus_lines:
             min_line = max(1, min(focus_lines) - self.scope_limit)
             max_line = max(focus_lines) + self.scope_limit
         else:
