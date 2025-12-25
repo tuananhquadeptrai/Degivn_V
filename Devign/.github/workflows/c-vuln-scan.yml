@@ -1,0 +1,148 @@
+name: C Vulnerability Scan
+
+on:
+  push:
+    paths:
+      - "**/*.c"
+      - "**/*.h"
+  pull_request:
+    paths:
+      - "**/*.c"
+      - "**/*.h"
+  workflow_dispatch:
+    inputs:
+      file_path:
+        description: "Path to C file to scan (optional)"
+        required: false
+        type: string
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        working-directory: Devign/C-Vul-Devign
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure model files are present
+        working-directory: Devign/C-Vul-Devign
+        run: |
+          mkdir -p models
+          missing=0
+          for model in models/best_v2_seed42.pt models/best_v2_seed1042.pt models/best_v2_seed2042.pt; do
+            if [ ! -f "$model" ]; then
+              echo "::warning::Model file $model is missing"
+              missing=$((missing + 1))
+            else
+              echo "Found: $model ($(ls -lh $model | awk '{print $5}'))"
+            fi
+          done
+          if [ "$missing" -eq 3 ]; then
+            echo "::error::All model files are missing. Please add them via Git LFS."
+            exit 1
+          fi
+          echo "Ensemble models ready: $((3 - missing))/3 available"
+
+      - name: Determine files to scan
+        id: files
+        working-directory: Devign/C-Vul-Devign
+        run: |
+          if [ -n "${{ inputs.file_path }}" ]; then
+            echo "files=${{ inputs.file_path }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin ${{ github.base_ref }} --depth=1
+            base_ref="origin/${{ github.base_ref }}"
+          else
+            base_ref="${{ github.event.before }}"
+          fi
+
+          if [ -z "$base_ref" ] || [ "$base_ref" = "0000000000000000000000000000000000000000" ]; then
+            files=$(git ls-files '*.c' '*.h')
+          else
+            files=$(git diff --name-only "$base_ref" ${{ github.sha }} -- '*.c' '*.h' || git ls-files '*.c' '*.h')
+          fi
+
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$files" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Run vulnerability scan
+        if: steps.files.outputs.files != ''
+        id: scan
+        working-directory: Devign/C-Vul-Devign
+        run: |
+          echo "## 🔍 C Vulnerability Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          failed=0
+          vuln_count=0
+          clean_count=0
+          
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            [ ! -f "$file" ] && continue
+            
+            echo "Analyzing: $file"
+            
+            result=$(python -m devign_pipeline.cli.analyze_file --file "$file" --json 2>&1) || true
+            
+            if echo "$result" | grep -q '"vulnerable": true'; then
+              vuln_count=$((vuln_count + 1))
+              score=$(echo "$result" | grep -oP '"score": \K[0-9.]+' || echo "N/A")
+              confidence=$(echo "$result" | grep -oP '"confidence": "\K[^"]+' || echo "N/A")
+              
+              echo "::error file=$file,line=1::VULNERABLE - Score: $score, Confidence: $confidence"
+              echo "| ❌ | \`$file\` | $score | $confidence | VULNERABLE |" >> $GITHUB_STEP_SUMMARY
+              failed=1
+            else
+              clean_count=$((clean_count + 1))
+              score=$(echo "$result" | grep -oP '"score": \K[0-9.]+' || echo "N/A")
+              confidence=$(echo "$result" | grep -oP '"confidence": "\K[^"]+' || echo "N/A")
+              
+              echo "::notice file=$file,line=1::Clean - Score: $score, Confidence: $confidence"
+              echo "| ✅ | \`$file\` | $score | $confidence | Clean |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done <<< "${{ steps.files.outputs.files }}"
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Summary:** $vuln_count vulnerable, $clean_count clean" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::$vuln_count file(s) detected as potentially vulnerable!"
+            exit 1
+          fi
+          
+          echo "All files passed vulnerability scan."
+        shell: bash
+
+      - name: No C files to scan
+        if: steps.files.outputs.files == ''
+        working-directory: Devign/C-Vul-Devign
+        run: |
+          echo "No C/H files changed in this commit."
+          echo "## ℹ️ No C files to scan" >> $GITHUB_STEP_SUMMARY
