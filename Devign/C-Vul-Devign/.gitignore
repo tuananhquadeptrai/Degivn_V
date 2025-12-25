@@ -11,7 +11,8 @@ Output data/results/
 Output/
 output/
 
-# Model checkpoints
+# Model checkpoints (except models/ for inference)
 *.pt
+!models/*.pt
 checkpoints/
 checkpoints_v2/
