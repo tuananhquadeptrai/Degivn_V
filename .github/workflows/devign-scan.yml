@@ -1,0 +1,66 @@
+name: Devign C Vulnerability Scan
+
+on:
+  push:
+    paths:
+      - 'Devign/C-Vul-Devign/**/*.c'
+      - 'Devign/C-Vul-Devign/**/*.h'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: Devign/C-Vul-Devign
+
+    steps:
+      - name: Checkout repository with Git LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check model files
+        run: ls -lh models/*.pt || echo "No models found"
+
+      - name: Run Devign vulnerability scan
+        run: |
+          set -e
+          
+          FILES=$(find . -name "*.c" -type f)
+          
+          if [ -z "$FILES" ]; then
+            echo "No .c files found."
+            exit 0
+          fi
+          
+          FAILED=0
+          
+          for f in $FILES; do
+            echo "Scanning $f ..."
+            result=$(python -m devign_pipeline.cli.analyze_file --file "$f" --json 2>&1) || true
+            echo "$result"
+            
+            if echo "$result" | grep -q '"vulnerable": true'; then
+              echo "❌ VULNERABLE: $f"
+              FAILED=1
+            else
+              echo "✅ SAFE: $f"
+            fi
+          done
+          
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::One or more files are vulnerable!"
+            exit 1
+          fi
+          
+          echo "All scanned files are safe."
