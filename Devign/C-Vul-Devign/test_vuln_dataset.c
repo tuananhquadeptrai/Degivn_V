@@ -81,3 +81,4 @@ static void usbredir_bulk_packet(void *priv, uint32_t id,
     free(data);
 
 }
+// trigger
