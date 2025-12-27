@@ -1,5 +1,9 @@
 # C Vulnerability Detection CI/CD
 
+![C Vulnerability Scan](https://github.com/<owner>/<repo>/actions/workflows/c-vuln-scan.yml/badge.svg?branch=main)
+
+> ⚠️ **Thay `<owner>/<repo>` bằng tên GitHub repo thực tế của bạn**
+
 Tự động phát hiện lỗ hổng bảo mật trong code C khi push lên GitHub.
 
 ## 🚀 Quick Start
