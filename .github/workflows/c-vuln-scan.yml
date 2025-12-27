@@ -82,10 +82,13 @@ jobs:
 
           # Handle initial commit (no before SHA)
           if [[ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
-            CHANGED_FILES=$(git ls-files -- 'Devign/C-Vul-Devign/**/*.c' 'Devign/C-Vul-Devign/**/*.h' || true)
+            ALL_FILES=$(git ls-files 'Devign/C-Vul-Devign/' || true)
           else
-            CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'Devign/C-Vul-Devign/**/*.c' 'Devign/C-Vul-Devign/**/*.h' || true)
+            ALL_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || true)
           fi
+
+          # Filter only .c and .h files in Devign/C-Vul-Devign/
+          CHANGED_FILES=$(echo "$ALL_FILES" | grep -E '^Devign/C-Vul-Devign/.*\.(c|h)$' || true)
 
           # Convert to relative paths (remove Devign/C-Vul-Devign/ prefix)
           if [[ -n "$CHANGED_FILES" ]]; then
