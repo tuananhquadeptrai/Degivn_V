@@ -5,6 +5,8 @@ on:
     paths:
       - "**/*.c"
       - "**/*.h"
+      - "devign_pipeline/**/*.py"
+      - "ensemble_config.json"
   pull_request:
     paths:
       - "**/*.c"
