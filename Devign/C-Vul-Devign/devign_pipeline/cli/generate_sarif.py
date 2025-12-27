@@ -115,12 +115,16 @@ def scan_file(file_path: str, path_prefix: str) -> List[Dict[str, Any]]:
     artifact_path = path_prefix + str(file_path)
     
     if prediction.vulnerable:
-        # Main vulnerability result
+        # Get the most suspicious line (highest attention) for main alert
+        main_line = highlights[0].line if highlights else 1
+        main_snippet = highlights[0].code_snippet if highlights else ""
+        
+        # Main vulnerability result - point to most suspicious line
         main_result = {
             "ruleId": "VULN001",
             "level": "error",
             "message": {
-                "text": f"Potential vulnerability detected (Score: {prediction.score:.4f}, Confidence: {prediction.confidence})"
+                "text": f"Potential vulnerability detected (Score: {prediction.score:.4f}, Confidence: {prediction.confidence}). Most suspicious: {main_snippet[:60]}"
             },
             "locations": [
                 {
@@ -129,7 +133,10 @@ def scan_file(file_path: str, path_prefix: str) -> List[Dict[str, Any]]:
                             "uri": artifact_path
                         },
                         "region": {
-                            "startLine": 1
+                            "startLine": main_line,
+                            "snippet": {
+                                "text": main_snippet
+                            }
                         }
                     }
                 }
@@ -143,13 +150,13 @@ def scan_file(file_path: str, path_prefix: str) -> List[Dict[str, Any]]:
         }
         results.append(main_result)
         
-        # Add highlighted locations as related results
+        # Add each highlighted location as separate alert
         for i, loc in enumerate(highlights):
             loc_result = {
                 "ruleId": "VULN002",
                 "level": "warning",
                 "message": {
-                    "text": f"[Rank {i+1}] Suspicious code (attention={loc.normalized_score:.2f}): {loc.code_snippet[:80]}..."
+                    "text": f"[Rank {i+1}] Suspicious code (attention={loc.normalized_score:.2f}): {loc.code_snippet[:80]}"
                 },
                 "locations": [
                     {
