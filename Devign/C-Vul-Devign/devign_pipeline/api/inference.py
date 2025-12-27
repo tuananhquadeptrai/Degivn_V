@@ -202,6 +202,13 @@ def detect_critical_patterns(code: str) -> Tuple[float, List[str]]:
     for match in free_calls:
         var_name = match.group(1)
         after_free = code[match.end():]
+        # Check if variable is nullified after free (safe pattern)
+        # Match both: var = NULL and *var = NULL
+        if re.search(rf'(\*\s*)?{re.escape(var_name)}\s*=\s*NULL\b', after_free[:100]):
+            continue
+        # Check for immediate return NULL after free (safe cleanup pattern)
+        if re.search(r'^\s*;\s*\n\s*return\s+NULL\s*;', after_free[:50]):
+            continue
         # Check if variable is used after free (not reassigned)
         if not re.search(rf'\b{re.escape(var_name)}\s*=', after_free[:100]):
             # Check if returned or dereferenced
@@ -209,8 +216,8 @@ def detect_critical_patterns(code: str) -> Tuple[float, List[str]]:
                 boost_score += 0.15
                 detected_patterns.append(f"use after free - returning freed '{var_name}'")
                 break
-            # Check for pointer dereference after free
-            if re.search(rf'\b{re.escape(var_name)}\s*(\[|->|\*)', after_free[:200]):
+            # Check for pointer dereference after free (exclude *var = NULL pattern)
+            if re.search(rf'\b{re.escape(var_name)}\s*(\[|->)', after_free[:200]):
                 boost_score += 0.15
                 detected_patterns.append(f"use after free - accessing freed '{var_name}'")
                 break
