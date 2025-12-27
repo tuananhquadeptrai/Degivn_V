@@ -2,7 +2,7 @@
   "num_seeds": 1,
   "pos_weight_scale": 1.12,
   "gate_init": 0.4,
-  "optimal_threshold": 0.60,
+  "optimal_threshold": 0.65,
   "test_f1_05": 0.7457156090782769,
   "test_opt_f1": 0.7726708074534161,
   "test_precision": 0.8022355975924333,

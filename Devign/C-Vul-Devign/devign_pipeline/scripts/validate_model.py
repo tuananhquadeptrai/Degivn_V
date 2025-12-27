@@ -15,7 +15,7 @@ AUC_THRESHOLD = 0.87
 def load_ensemble_config() -> dict:
     if ENSEMBLE_CONFIG_PATH.exists():
         return json.loads(ENSEMBLE_CONFIG_PATH.read_text())
-    return {"optimal_threshold": 0.37}
+    return {"optimal_threshold": 0.65}
 
 
 def validate_from_config(config: dict, f1_min: float, auc_min: float) -> bool:
@@ -27,7 +27,7 @@ def validate_from_config(config: dict, f1_min: float, auc_min: float) -> bool:
     test_auc = config.get("test_auc", 0)
     test_precision = config.get("test_precision", 0)
     test_recall = config.get("test_recall", 0)
-    threshold = config.get("optimal_threshold", 0.37)
+    threshold = config.get("optimal_threshold", 0.65)
     
     print(f"\nThreshold: {threshold:.4f}")
     print(f"\nMetrics:")

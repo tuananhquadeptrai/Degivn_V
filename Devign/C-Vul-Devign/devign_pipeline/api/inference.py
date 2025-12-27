@@ -54,6 +54,7 @@ VOCAB_PATH = Path("models/vocab.json")
 CONFIG_PATH = Path("models/config.json")
 FEATURE_STATS_PATH = Path("models/feature_stats.json")
 ENSEMBLE_CONFIG_PATH = Path("ensemble_config.json")
+CALIBRATOR_PATH = Path("models/calibrator.joblib")
 
 MAX_LEN = 512
 NUM_SLICES = 6
@@ -70,6 +71,7 @@ class PredictionResponse(BaseModel):
     score: float
     threshold: float
     confidence: str
+    detected_patterns: List[str] = []
 
 
 @dataclass
@@ -131,6 +133,91 @@ TAINT_SOURCES = {
 }
 
 
+def detect_critical_patterns(code: str) -> Tuple[float, List[str]]:
+    """Detect critical vulnerability patterns using static analysis.
+    
+    Returns:
+        Tuple of (boost_score, list_of_detected_patterns)
+    """
+    boost_score = 0.0
+    detected_patterns = []
+    
+    # 1. gets() - buffer overflow (boost +0.15)
+    if re.search(r'\bgets\s*\(', code):
+        boost_score += 0.15
+        detected_patterns.append("gets() - buffer overflow risk")
+    
+    # 2. printf/sprintf/fprintf with user input - format string (boost +0.12)
+    # Detect printf(var) or printf(buf) without format string literal
+    format_funcs = ['printf', 'sprintf', 'fprintf', 'vprintf', 'vsprintf']
+    for func in format_funcs:
+        # Match func(non-string-literal) - potential format string vuln
+        pattern = rf'\b{func}\s*\(\s*([^",\)]+)\s*\)'
+        matches = re.findall(pattern, code)
+        for match in matches:
+            # If argument is not a string literal, it's potentially dangerous
+            if not match.strip().startswith('"'):
+                boost_score += 0.12
+                detected_patterns.append(f"{func}(user_input) - format string vulnerability")
+                break
+    
+    # 3. strcpy/strcat without bounds check (boost +0.10)
+    for func in ['strcpy', 'strcat']:
+        if re.search(rf'\b{func}\s*\(', code):
+            # Check if strncpy/strncat is also used (indicates awareness of bounds)
+            safe_version = func.replace('cpy', 'ncpy').replace('cat', 'ncat')
+            if not re.search(rf'\b{safe_version}\s*\(', code):
+                # Check for sizeof or length checks nearby
+                if not re.search(r'\bsizeof\s*\(', code) and not re.search(r'\bstrlen\s*\(', code):
+                    boost_score += 0.10
+                    detected_patterns.append(f"{func}() without bounds check")
+    
+    # 4. malloc without NULL check (boost +0.08)
+    malloc_matches = list(re.finditer(r'(\w+)\s*=\s*(\(?\s*\w+\s*\*?\s*\)?)\s*malloc\s*\(', code))
+    for match in malloc_matches:
+        var_name = match.group(1)
+        # Look for NULL check after malloc
+        after_malloc = code[match.end():]
+        null_check_pattern = rf'\bif\s*\(\s*{re.escape(var_name)}\s*(==\s*NULL|!=\s*NULL|!|==\s*0|!=\s*0)'
+        if not re.search(null_check_pattern, after_malloc[:200]):
+            boost_score += 0.08
+            detected_patterns.append(f"malloc() without NULL check for '{var_name}'")
+            break
+    
+    # 5. Double free detection (boost +0.15)
+    free_calls = list(re.finditer(r'\bfree\s*\(\s*(\w+)\s*\)', code))
+    freed_vars = {}
+    for match in free_calls:
+        var_name = match.group(1)
+        if var_name in freed_vars:
+            # Check if the variable was reassigned between frees
+            between_code = code[freed_vars[var_name]:match.start()]
+            if not re.search(rf'\b{re.escape(var_name)}\s*=', between_code):
+                boost_score += 0.15
+                detected_patterns.append(f"double free on '{var_name}'")
+                break
+        freed_vars[var_name] = match.end()
+    
+    # 6. Use after free - return freed memory (boost +0.15)
+    for match in free_calls:
+        var_name = match.group(1)
+        after_free = code[match.end():]
+        # Check if variable is used after free (not reassigned)
+        if not re.search(rf'\b{re.escape(var_name)}\s*=', after_free[:100]):
+            # Check if returned or dereferenced
+            if re.search(rf'\breturn\s+{re.escape(var_name)}\b', after_free[:200]):
+                boost_score += 0.15
+                detected_patterns.append(f"use after free - returning freed '{var_name}'")
+                break
+            # Check for pointer dereference after free
+            if re.search(rf'\b{re.escape(var_name)}\s*(\[|->|\*)', after_free[:200]):
+                boost_score += 0.15
+                detected_patterns.append(f"use after free - accessing freed '{var_name}'")
+                break
+    
+    return (boost_score, detected_patterns)
+
+
 @dataclass
 class GraphAnalysis:
     """Results from AST/CFG/DFG analysis for vulnerability validation."""
@@ -153,9 +240,30 @@ class TokenInfo:
     end_pos: int
 
 
+def strip_comments(code: str) -> str:
+    """Remove all C/C++ comments completely from code.
+    
+    This removes both single-line (//) and multi-line (/* */) comments
+    to avoid comment bias in vulnerability detection.
+    """
+    # Remove multi-line comments /* */ completely
+    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    # Remove single-line comments // completely  
+    code = re.sub(r'//.*?$', '', code, flags=re.MULTILINE)
+    return code
+
+
 def tokenize_c_code_with_positions(code: str) -> Tuple[List[str], List[int]]:
-    """Tokenize C code and return tokens with their line numbers."""
-    lines = code.split('\n')
+    """Tokenize C code and return tokens with their line numbers.
+    
+    Comments are completely stripped before tokenization to avoid
+    comment bias in the model (e.g., comments mentioning 'vulnerability'
+    should not affect detection).
+    """
+    # Strip comments completely before processing
+    clean_code = strip_comments(code)
+    
+    lines = clean_code.split('\n')
     line_starts = [0]
     for line in lines:
         line_starts.append(line_starts[-1] + len(line) + 1)
@@ -165,9 +273,6 @@ def tokenize_c_code_with_positions(code: str) -> Tuple[List[str], List[int]]:
             if i + 1 < len(line_starts) and pos < line_starts[i + 1]:
                 return i + 1
         return len(lines)
-    
-    clean_code = re.sub(r'/\*.*?\*/', lambda m: ' ' * len(m.group()), code, flags=re.DOTALL)
-    clean_code = re.sub(r'//.*?$', lambda m: ' ' * len(m.group()), clean_code, flags=re.MULTILINE)
     
     patterns = [
         (r'"(?:[^"\\]|\\.)*"', 'STR'),
@@ -725,6 +830,7 @@ class ModelWrapper:
         config_path: Path = CONFIG_PATH,
         feature_stats_path: Path = FEATURE_STATS_PATH,
         ensemble_config_path: Path = ENSEMBLE_CONFIG_PATH,
+        calibrator_path: Path = CALIBRATOR_PATH,
         use_graph_slicing: bool = True,
         use_graph_postprocessing: bool = True,
     ) -> None:
@@ -733,6 +839,7 @@ class ModelWrapper:
         self.config_path = config_path
         self.feature_stats_path = feature_stats_path
         self.ensemble_config_path = ensemble_config_path
+        self.calibrator_path = calibrator_path
         self.use_graph_slicing = use_graph_slicing and GRAPH_AVAILABLE
         self.use_graph_postprocessing = use_graph_postprocessing and GRAPH_AVAILABLE
         
@@ -740,8 +847,9 @@ class ModelWrapper:
         self.ensemble_config = self._load_ensemble_config()
         self.vocab = self._load_vocab()
         self.feature_stats = self._load_feature_stats()
+        self.calibrator = self._load_calibrator()
         self.models = self._load_models()
-        self.threshold = float(self.ensemble_config.get("optimal_threshold", 0.37))
+        self.threshold = float(self.ensemble_config.get("optimal_threshold", 0.65))
         
         self.max_len = self.data_config.get("max_len", MAX_LEN)
         self.num_slices = self.data_config.get("max_slices", NUM_SLICES)
@@ -765,7 +873,7 @@ class ModelWrapper:
     def _load_ensemble_config(self) -> Dict[str, Any]:
         if self.ensemble_config_path.exists():
             return json.loads(self.ensemble_config_path.read_text())
-        return {"optimal_threshold": 0.37}
+        return {"optimal_threshold": 0.65}
 
     def _load_vocab(self) -> Dict[str, int]:
         if self.vocab_path.exists():
@@ -778,6 +886,28 @@ class ModelWrapper:
             data = json.loads(self.feature_stats_path.read_text())
             return data.get("feature_stats", {})
         return {}
+    
+    def _load_calibrator(self) -> Optional[Any]:
+        """Load isotonic calibrator if available."""
+        if self.calibrator_path.exists():
+            try:
+                import joblib
+                calibrator = joblib.load(self.calibrator_path)
+                logger.info(f"Loaded isotonic calibrator from {self.calibrator_path}")
+                return calibrator
+            except Exception as e:
+                logger.warning(f"Failed to load calibrator: {e}")
+        return None
+    
+    def _calibrate_probability(self, prob: float) -> float:
+        """Apply isotonic calibration to raw probability."""
+        if self.calibrator is not None:
+            try:
+                calibrated = self.calibrator.predict([prob])[0]
+                return float(calibrated)
+            except Exception as e:
+                logger.debug(f"Calibration failed, using raw prob: {e}")
+        return prob
 
     def _load_single_model(self, model_path: Path) -> HierarchicalBiGRU:
         """Load a single model from path."""
@@ -1060,6 +1190,7 @@ class ModelWrapper:
         
         If graph-based post-processing is enabled, it may adjust scores
         for borderline predictions based on code structure analysis.
+        Static analysis patterns are used to boost detection of critical vulnerabilities.
         """
         inputs = self._preprocess(code)
         
@@ -1074,16 +1205,25 @@ class ModelWrapper:
         
         avg_prob = sum(probs) / len(probs)
         
+        # Apply isotonic calibration
+        calibrated_prob = self._calibrate_probability(avg_prob)
+        
         # Apply graph-based post-processing for borderline predictions
-        adjusted_prob = avg_prob
+        adjusted_prob = calibrated_prob
         graph_analysis = None
         
         if self.use_graph_postprocessing and self.graph_analyzer:
             try:
                 graph_analysis = self.graph_analyzer.analyze(code)
-                adjusted_prob = self._apply_graph_postprocessing(avg_prob, graph_analysis)
+                adjusted_prob = self._apply_graph_postprocessing(calibrated_prob, graph_analysis)
             except Exception as e:
                 logger.debug(f"Graph post-processing failed: {e}")
+        
+        # Apply static analysis pattern detection boost
+        boost_score, detected_patterns = detect_critical_patterns(code)
+        if boost_score > 0:
+            adjusted_prob = min(1.0, adjusted_prob + boost_score)
+            logger.debug(f"Pattern boost: +{boost_score:.2f}, patterns: {detected_patterns}")
         
         vulnerable = adjusted_prob >= self.threshold
         
@@ -1092,6 +1232,7 @@ class ModelWrapper:
             score=round(adjusted_prob, 4),
             threshold=self.threshold,
             confidence=self._get_confidence(adjusted_prob),
+            detected_patterns=detected_patterns,
         )
     
     def _apply_graph_postprocessing(
@@ -1162,14 +1303,23 @@ class ModelWrapper:
         
         avg_prob = sum(probs) / len(probs)
         
+        # Apply isotonic calibration
+        calibrated_prob = self._calibrate_probability(avg_prob)
+        
         # Apply graph-based post-processing for borderline predictions
-        adjusted_prob = avg_prob
+        adjusted_prob = calibrated_prob
         if self.use_graph_postprocessing and self.graph_analyzer:
             try:
                 graph_analysis = self.graph_analyzer.analyze(code)
-                adjusted_prob = self._apply_graph_postprocessing(avg_prob, graph_analysis)
+                adjusted_prob = self._apply_graph_postprocessing(calibrated_prob, graph_analysis)
             except Exception as e:
                 logger.debug(f"Graph post-processing failed: {e}")
+        
+        # Apply static analysis pattern detection boost
+        boost_score, detected_patterns = detect_critical_patterns(code)
+        if boost_score > 0:
+            adjusted_prob = min(1.0, adjusted_prob + boost_score)
+            logger.debug(f"Pattern boost: +{boost_score:.2f}, patterns: {detected_patterns}")
         
         vulnerable = adjusted_prob >= self.threshold
         
@@ -1178,6 +1328,7 @@ class ModelWrapper:
             score=round(adjusted_prob, 4),
             threshold=self.threshold,
             confidence=self._get_confidence(adjusted_prob),
+            detected_patterns=detected_patterns,
         )
         
         highlights = []

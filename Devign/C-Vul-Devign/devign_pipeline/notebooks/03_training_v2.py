@@ -43,6 +43,147 @@ with open(f'{DATA_DIR}/config.json') as f:
     data_config = json.load(f)
 print(f"Config: vocab={data_config['vocab_size']}, version={data_config['version']}")
 
+# ===== DATA AUGMENTATION FOR VULNERABLE CLASS =====
+class VulnerableAugmenter:
+    """Augmentation techniques for vulnerable code samples."""
+    
+    # C keywords that should not be modified
+    C_KEYWORDS = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                  21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40}
+    
+    def __init__(self, dropout_rate=0.07, shuffle_prob=0.1, seed=42):
+        self.dropout_rate = dropout_rate  # 5-10% token dropout
+        self.shuffle_prob = shuffle_prob  # Probability of swapping adjacent tokens
+        self.rng = np.random.RandomState(seed)
+    
+    def _is_keyword(self, token_id):
+        """Check if token is a C keyword (should not be modified)."""
+        return int(token_id) in self.C_KEYWORDS or token_id == 0  # 0 is padding
+    
+    def token_dropout(self, input_ids, attention_mask):
+        """Randomly drop 5-10% tokens (except keywords and padding)."""
+        ids = input_ids.copy()
+        mask = attention_mask.copy()
+        
+        for i in range(len(ids)):
+            if mask[i] == 1 and not self._is_keyword(ids[i]):
+                if self.rng.random() < self.dropout_rate:
+                    ids[i] = 0  # Set to padding
+                    mask[i] = 0
+        return ids, mask
+    
+    def token_shuffle(self, input_ids, attention_mask):
+        """Swap adjacent non-keyword tokens with given probability."""
+        ids = input_ids.copy()
+        mask = attention_mask.copy()
+        
+        i = 0
+        while i < len(ids) - 1:
+            if (mask[i] == 1 and mask[i+1] == 1 and 
+                not self._is_keyword(ids[i]) and not self._is_keyword(ids[i+1])):
+                if self.rng.random() < self.shuffle_prob:
+                    ids[i], ids[i+1] = ids[i+1], ids[i]
+                    i += 2  # Skip next token to avoid double-swapping
+                    continue
+            i += 1
+        return ids, mask
+    
+    def synonym_replacement(self, input_ids, attention_mask):
+        """Re-index VAR_X and FUNC_X tokens (e.g., VAR_0 -> VAR_5)."""
+        ids = input_ids.copy()
+        
+        # Assume VAR tokens are in range 100-119 (VAR_0 to VAR_19)
+        # Assume FUNC tokens are in range 120-139 (FUNC_0 to FUNC_19)
+        VAR_START, VAR_END = 100, 119
+        FUNC_START, FUNC_END = 120, 139
+        
+        for i in range(len(ids)):
+            if attention_mask[i] == 0:
+                continue
+            
+            token = ids[i]
+            if VAR_START <= token <= VAR_END:
+                offset = self.rng.randint(1, 10)  # Shift by 1-9
+                new_idx = VAR_START + ((token - VAR_START + offset) % 20)
+                ids[i] = new_idx
+            elif FUNC_START <= token <= FUNC_END:
+                offset = self.rng.randint(1, 10)
+                new_idx = FUNC_START + ((token - FUNC_START + offset) % 20)
+                ids[i] = new_idx
+        
+        return ids, attention_mask
+    
+    def augment(self, input_ids, attention_mask):
+        """Apply random combination of augmentations."""
+        # Choose which augmentations to apply
+        aug_choice = self.rng.randint(0, 3)
+        
+        if aug_choice == 0:
+            return self.token_dropout(input_ids, attention_mask)
+        elif aug_choice == 1:
+            return self.token_shuffle(input_ids, attention_mask)
+        else:
+            return self.synonym_replacement(input_ids, attention_mask)
+
+
+class AugmentedDevignDataset(Dataset):
+    """Wrapper dataset that augments vulnerable samples 2x."""
+    
+    def __init__(self, base_dataset, num_augmentations=2, seed=42):
+        self.base_dataset = base_dataset
+        self.num_augmentations = num_augmentations
+        self.augmenter = VulnerableAugmenter(seed=seed)
+        
+        # Build index mapping
+        self.index_map = []  # (base_idx, aug_idx) where aug_idx=0 means original
+        
+        for i in range(len(base_dataset)):
+            label = base_dataset.labels[i]
+            self.index_map.append((i, 0))  # Original sample
+            if label == 1:  # Vulnerable sample
+                for aug_idx in range(1, num_augmentations + 1):
+                    self.index_map.append((i, aug_idx))
+        
+        # Count samples
+        n_orig = len(base_dataset)
+        n_vuln = np.sum(base_dataset.labels == 1)
+        n_aug = n_vuln * num_augmentations
+        print(f"  AugmentedDataset: {n_orig} original + {n_aug} augmented = {len(self.index_map)} total")
+        print(f"  New class ratio: {n_orig - n_vuln} clean vs {n_vuln + n_aug} vuln")
+    
+    def __len__(self):
+        return len(self.index_map)
+    
+    def __getitem__(self, idx):
+        base_idx, aug_idx = self.index_map[idx]
+        item = self.base_dataset[base_idx]
+        
+        if aug_idx > 0:  # Apply augmentation
+            # Set seed based on idx for reproducibility
+            self.augmenter.rng = np.random.RandomState(42 + idx * 100 + aug_idx)
+            
+            # Augment main input
+            input_ids = item['input_ids'].numpy()
+            attention_mask = item['attention_mask'].numpy()
+            aug_ids, aug_mask = self.augmenter.augment(input_ids, attention_mask)
+            item['input_ids'] = torch.tensor(aug_ids, dtype=torch.long)
+            item['attention_mask'] = torch.tensor(aug_mask, dtype=torch.float)
+            
+            # Augment slices if present
+            if 'slice_input_ids' in item:
+                slice_ids = item['slice_input_ids'].numpy()
+                slice_mask = item['slice_attention_mask'].numpy()
+                S, L = slice_ids.shape
+                for s in range(S):
+                    aug_s_ids, aug_s_mask = self.augmenter.augment(slice_ids[s], slice_mask[s])
+                    slice_ids[s] = aug_s_ids
+                    slice_mask[s] = aug_s_mask
+                item['slice_input_ids'] = torch.tensor(slice_ids, dtype=torch.long)
+                item['slice_attention_mask'] = torch.tensor(slice_mask, dtype=torch.float)
+        
+        return item
+
+
 # Dataset
 class DevignV2Dataset(Dataset):
     def __init__(self, npz_path, max_len=512):
@@ -84,12 +225,16 @@ class DevignV2Dataset(Dataset):
         return item
 
 print("Loading data...")
-train_ds = DevignV2Dataset(f'{DATA_DIR}/train.npz')
+train_ds_base = DevignV2Dataset(f'{DATA_DIR}/train.npz')
 val_ds = DevignV2Dataset(f'{DATA_DIR}/val.npz')
 test_ds = DevignV2Dataset(f'{DATA_DIR}/test.npz')
 
-n_neg, n_pos = np.sum(train_ds.labels==0), np.sum(train_ds.labels==1)
-print(f"Classes: neg={n_neg}, pos={n_pos}")
+n_neg, n_pos = np.sum(train_ds_base.labels==0), np.sum(train_ds_base.labels==1)
+print(f"Original classes: neg={n_neg}, pos={n_pos}")
+
+# Apply augmentation to training set (2x augmentation for vulnerable samples)
+print("Applying data augmentation for vulnerable class...")
+train_ds = AugmentedDevignDataset(train_ds_base, num_augmentations=2, seed=42)
 
 # Model - Enhanced with all Oracle recommendations
 class HierarchicalBiGRU(nn.Module):
@@ -463,6 +608,12 @@ plt.tight_layout()
 plt.savefig(f'{PLOTS_DIR}/confusion_matrix.png', dpi=150)
 plt.show()
 print(f"Saved confusion matrix to {PLOTS_DIR}/confusion_matrix.png")
+
+# Save calibrator for inference
+import joblib
+calibrator_path = f'{MODEL_DIR}/calibrator.joblib'
+joblib.dump(calibrator, calibrator_path)
+print(f"Saved isotonic calibrator to {calibrator_path}")
 
 # Save ensemble config
 ensemble_config = {

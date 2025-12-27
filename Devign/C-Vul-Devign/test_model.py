@@ -1,8 +1,21 @@
 """Test vulnerability detection on C code."""
 
+import json
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+ENSEMBLE_CONFIG_PATH = Path("ensemble_config.json")
+
+
+def load_threshold() -> float:
+    """Load threshold from ensemble_config.json."""
+    if ENSEMBLE_CONFIG_PATH.exists():
+        config = json.loads(ENSEMBLE_CONFIG_PATH.read_text())
+        return float(config.get("optimal_threshold", 0.65))
+    return 0.65
 
 class HierarchicalBiGRU(nn.Module):
     def __init__(self, vocab_size=238, embed_dim=96, hidden_dim=192, slice_hidden=160,
@@ -133,7 +146,7 @@ def test_dummy():
         probs = F.softmax(logits, dim=1)
         vuln_prob = probs[0, 1].item()
         
-    threshold = 0.37
+    threshold = load_threshold()
     print(f"\nVulnerability probability: {vuln_prob:.4f}")
     print(f"Threshold: {threshold}")
     print(f"Prediction: {'VULNERABLE' if vuln_prob >= threshold else 'SAFE'}")
