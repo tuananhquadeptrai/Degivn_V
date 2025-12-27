@@ -37,3 +37,4 @@ int main(int argc, char *argv[]) {
 }
 
 // Test trigger
+// Trigger annotation test
