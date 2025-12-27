@@ -28,19 +28,19 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
-        working-directory: C-Vul-Devign
+        working-directory: Devign/C-Vul-Devign
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Check model files
-        working-directory: C-Vul-Devign
+        working-directory: Devign/C-Vul-Devign
         run: |
           echo "Checking model files..."
           ls -lh models/*.pt || echo "No model files found"
 
       - name: Scan C files
-        working-directory: C-Vul-Devign
+        working-directory: Devign/C-Vul-Devign
         run: |
           echo "## 🔍 C Vulnerability Scan Results" >> $GITHUB_STEP_SUMMARY
           
