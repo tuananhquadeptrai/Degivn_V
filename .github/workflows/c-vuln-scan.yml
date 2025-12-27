@@ -130,7 +130,8 @@ jobs:
             set +e
             python -m devign_pipeline.cli.analyze_file \
               --file "$file" \
-              --github-annotations
+              --github-annotations \
+              --path-prefix "Devign/C-Vul-Devign/"
             EXIT_CODE=$?
             set -e
 

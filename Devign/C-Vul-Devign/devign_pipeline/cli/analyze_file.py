@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to model file (default: models/best_v2_seed42.pt).",
     )
+    parser.add_argument(
+        "--path-prefix",
+        type=str,
+        default="",
+        help="Prefix to add to file path in GitHub annotations (e.g., 'Devign/C-Vul-Devign/').",
+    )
     return parser.parse_args()
 
 
@@ -100,9 +106,10 @@ def main() -> None:
         highlights = []
 
     if args.github_annotations:
+        annotation_path = args.path_prefix + str(file_path)
         if prediction.vulnerable:
             emit_github_annotation(
-                path=str(file_path),
+                path=annotation_path,
                 line=1,
                 level="error",
                 message=f"VULNERABLE - Score: {prediction.score:.4f}, Confidence: {prediction.confidence}",
@@ -110,14 +117,14 @@ def main() -> None:
             
             for i, loc in enumerate(highlights):
                 emit_github_annotation(
-                    path=str(file_path),
+                    path=annotation_path,
                     line=loc.line,
                     level="warning",
                     message=f"[Rank {i+1}] Suspicious code (attention={loc.normalized_score:.2f}): {loc.code_snippet[:60]}...",
                 )
         else:
             emit_github_annotation(
-                path=str(file_path),
+                path=annotation_path,
                 line=1,
                 level="notice",
                 message=f"Clean - Score: {prediction.score:.4f}, Confidence: {prediction.confidence}",
