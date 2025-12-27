@@ -12,18 +12,21 @@ on:
   workflow_dispatch:
     inputs:
       file:
-        description: 'Optional C file path to scan (relative to Devign/C-Vul-Devign/)'
+        description: 'Optional C file path to scan'
         required: false
         default: ''
-
-defaults:
-  run:
-    working-directory: Devign/C-Vul-Devign
 
 jobs:
   scan:
     name: Scan C files for vulnerabilities
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+
+    defaults:
+      run:
+        working-directory: Devign/C-Vul-Devign
 
     steps:
       - name: Checkout repository (with Git LFS)
@@ -103,6 +106,7 @@ jobs:
           fi
 
       - name: Run vulnerability scan
+        id: scan
         if: steps.files.outputs.files != ''
         shell: bash
         run: |
@@ -164,19 +168,49 @@ jobs:
           echo "Vulnerable:    $VULNERABLE"
           echo "Clean:         $((SCANNED - VULNERABLE))"
           echo "============================================"
+          
+          echo "vulnerable=$VULNERABLE" >> "$GITHUB_OUTPUT"
 
           if [[ $FAILED -ne 0 ]]; then
             echo ""
             echo "⚠️  One or more vulnerable files detected."
             echo "Please review the annotations above and fix the security issues."
-            exit 1
           else
             echo ""
             echo "✅ All scanned files are clean."
           fi
+
+      - name: Generate SARIF report
+        if: steps.files.outputs.files != ''
+        continue-on-error: true
+        run: |
+          FILES="${{ steps.files.outputs.files }}"
+          python -m devign_pipeline.cli.generate_sarif \
+            --files $FILES \
+            --output results.sarif \
+            --path-prefix "Devign/C-Vul-Devign/" || true
+          
+          if [ -f "results.sarif" ]; then
+            echo "SARIF report generated:"
+            head -50 results.sarif
+          fi
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: steps.files.outputs.files != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: Devign/C-Vul-Devign/results.sarif
+          category: "devign-vulnerability-scan"
 
       - name: No C files changed
         if: steps.files.outputs.files == ''
         run: |
           echo "ℹ️  No C/H files changed in this commit/PR."
           echo "Skipping vulnerability scan."
+
+      - name: Fail if vulnerabilities found
+        if: steps.scan.outputs.vulnerable != '' && steps.scan.outputs.vulnerable != '0'
+        run: |
+          echo "❌ Vulnerabilities detected! Failing the build."
+          exit 1
